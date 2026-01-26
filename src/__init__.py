@@ -7,7 +7,13 @@ from .indicators import TechnicalIndicators
 from .analysis import DeclineAnalyzer, SMARelationshipAnalyzer
 from .visualization import BacktestVisualizer
 from .collapse_detector import CollapseDetector, CollapseEvent, CollapseSignal
-from .returns_analysis import ReturnsRegimeAnalyzer, ReturnsVisualizer, RegimeStats
+from .returns_analysis import (
+    ReturnsRegimeAnalyzer,
+    ReturnsVisualizer,
+    RegimeStats,
+    RollingReturnsAnalyzer,
+    RollingReturnsVisualizer,
+)
 
 __all__ = [
     "DataFetcher",
@@ -21,4 +27,6 @@ __all__ = [
     "ReturnsRegimeAnalyzer",
     "ReturnsVisualizer",
     "RegimeStats",
+    "RollingReturnsAnalyzer",
+    "RollingReturnsVisualizer",
 ]

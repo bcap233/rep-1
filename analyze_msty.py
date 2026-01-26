@@ -26,7 +26,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.data_fetcher import DataFetcher
 from src.collapse_detector import CollapseDetector, CollapseEvent
-from src.returns_analysis import ReturnsRegimeAnalyzer, ReturnsVisualizer
+from src.returns_analysis import (
+    ReturnsRegimeAnalyzer,
+    ReturnsVisualizer,
+    RollingReturnsAnalyzer,
+    RollingReturnsVisualizer,
+)
 
 
 def print_header(text: str):
@@ -460,6 +465,166 @@ def run_msty_analysis(lookback_days: int = 365, show_current_only: bool = False)
     print_subheader("Generating Returns Charts")
     returns_viz.plot_returns_by_regime(returns_df, regime_stats, ticker="MSTY")
     returns_viz.plot_return_distribution_by_distance(distribution, ticker="MSTY")
+
+    # ================================================================
+    # ROLLING RETURNS ANALYSIS
+    # ================================================================
+    print_header("Rolling Total Returns Analysis")
+    print("Analyzing rolling returns across different timeframes to identify")
+    print("patterns and thresholds that precede large selloffs...")
+
+    rolling_analyzer = RollingReturnsAnalyzer(windows=[5, 10, 20, 30, 60])
+    rolling_viz = RollingReturnsVisualizer()
+
+    # Calculate rolling returns
+    rolling_df = rolling_analyzer.calculate_rolling_returns(df, price_col="price")
+
+    # Identify historical selloff events
+    selloffs = rolling_analyzer.identify_selloff_events(rolling_df, threshold=-15, price_col="price")
+    print(f"\nIdentified {len(selloffs)} selloff events (>15% drawdown)")
+
+    if selloffs:
+        print_subheader("Selloff Events")
+        selloff_table = []
+        for i, s in enumerate(selloffs[:10], 1):  # Show first 10
+            selloff_table.append([
+                i,
+                s["start_date"].date(),
+                s["trough_date"].date(),
+                f"{s['max_drawdown']:.1f}%",
+                s["duration_to_trough"],
+            ])
+        print(tabulate(
+            selloff_table,
+            headers=["#", "Start", "Trough", "Max DD", "Days to Trough"],
+            tablefmt="simple"
+        ))
+
+    # Current rolling returns status
+    print_subheader("Current Rolling Returns Status")
+    current_status = rolling_analyzer.get_current_rolling_status(rolling_df)
+
+    if current_status:
+        print(f"Date: {current_status['date'].date()}\n")
+        status_table = []
+        for window, stats in current_status["windows"].items():
+            ret = stats.get("return", float("nan"))
+            slope = stats.get("slope", float("nan"))
+            zscore = stats.get("zscore", float("nan"))
+            status_table.append([
+                f"{window}D",
+                f"{ret:.2f}%" if not pd.isna(ret) else "N/A",
+                f"{slope:.2f}" if not pd.isna(slope) else "N/A",
+                f"{zscore:.2f}" if not pd.isna(zscore) else "N/A",
+            ])
+
+        print(tabulate(
+            status_table,
+            headers=["Window", "Rolling Return", "Slope", "Z-Score"],
+            tablefmt="simple"
+        ))
+
+        if current_status["warning_signals"]:
+            print(f"\n⚠️  WARNING SIGNALS ({current_status['alert_level']}):")
+            for signal in current_status["warning_signals"]:
+                print(f"    - {signal}")
+        else:
+            print("\n✓ No warning signals currently active")
+
+    # Analyze what rolling returns looked like before selloffs
+    if selloffs:
+        print_subheader("Rolling Returns Before Selloffs")
+        pre_selloff = rolling_analyzer.analyze_returns_before_selloffs(
+            rolling_df, selloffs, lookback_days=[5, 10, 20]
+        )
+
+        if not pre_selloff.empty:
+            # Summarize by lookback period
+            print("Average rolling returns X days BEFORE selloff started:\n")
+            summary_rows = []
+            for lb in [5, 10, 20]:
+                lb_data = pre_selloff[pre_selloff["lookback_days"] == lb]
+                if lb_data.empty:
+                    continue
+                row = [f"{lb}d before"]
+                for window in [10, 20, 30]:
+                    col = f"ret_{window}d"
+                    if col in lb_data.columns:
+                        avg = lb_data[col].mean()
+                        row.append(f"{avg:.1f}%")
+                    else:
+                        row.append("N/A")
+                summary_rows.append(row)
+
+            print(tabulate(
+                summary_rows,
+                headers=["Lookback", "10D Ret", "20D Ret", "30D Ret"],
+                tablefmt="simple"
+            ))
+
+            print("\nKEY INSIGHT:")
+            # Find the pattern
+            lb_20 = pre_selloff[pre_selloff["lookback_days"] == 20]
+            if not lb_20.empty and "ret_20d" in lb_20.columns:
+                avg_20d_ret = lb_20["ret_20d"].mean()
+                pct_negative = (lb_20["ret_20d"] < 0).mean() * 100
+                print(f"  20 days before selloffs, the 20-day rolling return averaged: {avg_20d_ret:.1f}%")
+                print(f"  {pct_negative:.0f}% of the time, it was already negative")
+
+    # Find predictive thresholds
+    if selloffs:
+        print_subheader("Predictive Rolling Return Thresholds")
+        print("Finding the rolling return level that best predicts upcoming selloffs...\n")
+
+        optimal_thresholds = rolling_analyzer.find_predictive_thresholds(
+            rolling_df, selloffs, forward_days=20
+        )
+
+        if not optimal_thresholds.empty:
+            print(tabulate(
+                optimal_thresholds,
+                headers=["Window", "Threshold", "Accuracy %", "Signals"],
+                tablefmt="simple",
+                floatfmt=(".0f", ".0f", ".1f", ".0f")
+            ))
+
+            # Best predictor
+            best = optimal_thresholds.loc[optimal_thresholds["accuracy"].idxmax()]
+            print(f"\n🎯 BEST PREDICTOR: {int(best['window'])}-day rolling return")
+            print(f"   When it drops below {int(best['optimal_threshold'])}%, ")
+            print(f"   there's a {best['accuracy']:.0f}% chance of selloff within 20 days")
+
+    # Analyze returns at different rolling return levels
+    print_subheader("Forward Returns by Rolling Return Level")
+    level_analysis = rolling_analyzer.analyze_rolling_return_levels(rolling_df, price_col="price")
+
+    if not level_analysis.empty:
+        # Show for 20-day window
+        analysis_20d = level_analysis[level_analysis["window"] == 20].copy()
+        if not analysis_20d.empty:
+            print("When 20-day rolling return is at these levels, what happens next?\n")
+            print(tabulate(
+                analysis_20d[["rolling_return_range", "num_observations", "avg_fwd_10d", "pct_negative_fwd_10d", "worst_fwd_20d"]],
+                headers=["20D Return Level", "# Obs", "Avg 10D Fwd", "% Neg 10D", "Worst 20D"],
+                tablefmt="simple",
+                floatfmt=("", ".0f", ".2f", ".1f", ".1f")
+            ))
+
+            # Find danger zone
+            danger_zones = analysis_20d[analysis_20d["avg_fwd_10d"] < -2]
+            if not danger_zones.empty:
+                worst = danger_zones.loc[danger_zones["avg_fwd_10d"].idxmin()]
+                print(f"\n⚠️  DANGER ZONE: When 20D return is {worst['rolling_return_range']}")
+                print(f"    Average 10-day forward return: {worst['avg_fwd_10d']:.2f}%")
+                print(f"    {worst['pct_negative_fwd_10d']:.0f}% of the time, next 10 days are negative")
+
+    # Generate rolling returns visualizations
+    print_subheader("Generating Rolling Returns Charts")
+    if selloffs:
+        rolling_viz.plot_rolling_returns_with_selloffs(rolling_df, selloffs, windows=[10, 20, 30], ticker="MSTY")
+        rolling_viz.plot_pre_selloff_patterns(pre_selloff, ticker="MSTY")
+        if not optimal_thresholds.empty:
+            rolling_viz.plot_predictive_thresholds(optimal_thresholds, ticker="MSTY")
 
     # ================================================================
     # KEY INSIGHTS
