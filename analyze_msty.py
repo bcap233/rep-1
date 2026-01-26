@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.data_fetcher import DataFetcher
 from src.collapse_detector import CollapseDetector, CollapseEvent
+from src.returns_analysis import ReturnsRegimeAnalyzer, ReturnsVisualizer
 
 
 def print_header(text: str):
@@ -358,6 +359,107 @@ def run_msty_analysis(lookback_days: int = 365, show_current_only: bool = False)
             print(f"  Average velocity at trigger: {np.mean([c.velocity_at_trigger for c in true_collapses]):.2f}%/day")
     else:
         print("No collapse events meeting criteria found in this period.")
+
+    # ================================================================
+    # RETURNS BY SMA REGIME
+    # ================================================================
+    print_header("Returns Analysis by SMA Regime")
+    print("How do total returns shift based on position relative to the 50 SMA?")
+
+    returns_analyzer = ReturnsRegimeAnalyzer(sma_period=50)
+    returns_viz = ReturnsVisualizer()
+
+    # Prepare returns data
+    returns_df = returns_analyzer.prepare_returns_data(df, price_col="price")
+    returns_df = returns_analyzer.calculate_rolling_regime_returns(returns_df, window=20)
+
+    # Calculate regime statistics
+    regime_stats = returns_analyzer.calculate_regime_stats(returns_df, "regime_simple")
+
+    print_subheader("Return Statistics by Regime")
+    if regime_stats:
+        regime_table = []
+        for regime in ["trending_up", "near_sma", "trending_down"]:
+            if regime in regime_stats:
+                s = regime_stats[regime]
+                regime_table.append([
+                    regime,
+                    s.num_days,
+                    f"{s.total_return_pct:.2f}%",
+                    f"{s.avg_daily_return:.3f}%",
+                    f"{s.pct_positive_days:.1f}%",
+                    f"{s.skewness:.2f}",
+                    f"{s.worst_day:.2f}%",
+                    f"{s.best_day:.2f}%",
+                ])
+
+        print(tabulate(
+            regime_table,
+            headers=["Regime", "Days", "Total Return", "Avg Daily", "% Positive", "Skew", "Worst Day", "Best Day"],
+            tablefmt="simple"
+        ))
+
+        # Key insight about regimes
+        print("\nKEY FINDING:")
+        if "trending_down" in regime_stats and "trending_up" in regime_stats:
+            down_stats = regime_stats["trending_down"]
+            up_stats = regime_stats["trending_up"]
+            print(f"  When TRENDING DOWN (>5% below SMA):")
+            print(f"    - Total return: {down_stats.total_return_pct:.2f}%")
+            print(f"    - Only {down_stats.pct_positive_days:.1f}% of days are positive")
+            print(f"    - Return skew: {down_stats.skewness:.2f} (negative = more extreme losses)")
+            print(f"\n  When TRENDING UP (>5% above SMA):")
+            print(f"    - Total return: {up_stats.total_return_pct:.2f}%")
+            print(f"    - {up_stats.pct_positive_days:.1f}% of days are positive")
+            print(f"    - Return skew: {up_stats.skewness:.2f}")
+
+    # Analyze return distribution by distance
+    print_subheader("Return Distribution by SMA Distance")
+    distribution = returns_analyzer.analyze_return_distribution_by_sma_distance(
+        returns_df,
+        distance_bins=[-30, -20, -10, -5, 0, 5, 10, 20, 30]
+    )
+
+    if not distribution.empty:
+        print(tabulate(
+            distribution[["distance_range", "num_days", "avg_daily_return", "pct_negative", "p10_return", "p90_return"]],
+            headers=["Distance Range", "Days", "Avg Return", "% Negative", "10th Pctl", "90th Pctl"],
+            tablefmt="simple",
+            floatfmt=("", ".0f", ".3f", ".1f", ".2f", ".2f")
+        ))
+
+        # Find the inflection point where returns turn negative
+        negative_zones = distribution[distribution["avg_daily_return"] < 0]
+        if not negative_zones.empty:
+            worst_zone = negative_zones.loc[negative_zones["avg_daily_return"].idxmin()]
+            print(f"\n  WORST ZONE: {worst_zone['distance_range']}")
+            print(f"    Average daily return: {worst_zone['avg_daily_return']:.3f}%")
+            print(f"    {worst_zone['pct_negative']:.0f}% of days are negative")
+
+    # Cumulative return breakdown
+    print_subheader("Cumulative Return Breakdown")
+    if "cumul_return_trending_down" in returns_df.columns:
+        final_down = returns_df["cumul_return_trending_down"].iloc[-1]
+        final_near = returns_df["cumul_return_near_sma"].iloc[-1]
+        final_up = returns_df["cumul_return_trending_up"].iloc[-1]
+        total = final_down + final_near + final_up
+
+        print(f"  Return earned while TRENDING DOWN: {final_down:.2f}%")
+        print(f"  Return earned while NEAR SMA:      {final_near:.2f}%")
+        print(f"  Return earned while TRENDING UP:   {final_up:.2f}%")
+        print(f"  -----------------------------------")
+        print(f"  TOTAL CUMULATIVE RETURN:           {total:.2f}%")
+
+        if total != 0:
+            print(f"\n  Contribution breakdown:")
+            print(f"    Trending down: {(final_down/total)*100:.1f}% of total return")
+            print(f"    Near SMA:      {(final_near/total)*100:.1f}% of total return")
+            print(f"    Trending up:   {(final_up/total)*100:.1f}% of total return")
+
+    # Generate returns visualizations
+    print_subheader("Generating Returns Charts")
+    returns_viz.plot_returns_by_regime(returns_df, regime_stats, ticker="MSTY")
+    returns_viz.plot_return_distribution_by_distance(distribution, ticker="MSTY")
 
     # ================================================================
     # KEY INSIGHTS
