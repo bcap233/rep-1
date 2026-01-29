@@ -24,6 +24,12 @@ from .dividend_analysis import (
     DividendVisualizer,
     DividendPayment,
 )
+from .strategy_backtest import (
+    StrategyBacktester,
+    StrategyVisualizer,
+    StrategyResult,
+    Trade,
+)
 
 __all__ = [
     "DataFetcher",
@@ -45,4 +51,8 @@ __all__ = [
     "DividendAnalyzer",
     "DividendVisualizer",
     "DividendPayment",
+    "StrategyBacktester",
+    "StrategyVisualizer",
+    "StrategyResult",
+    "Trade",
 ]
