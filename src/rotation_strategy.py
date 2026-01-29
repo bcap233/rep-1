@@ -477,6 +477,105 @@ class RotationBacktester:
         )
 
 
+    def run_v5_sma_hysteresis(
+        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
+        sma_period: int = 50,
+        band_pct: float = 3.0,
+        debounce_days: int = 3,
+    ) -> RotationResult:
+        """
+        V5 Hysteresis: SMA + dead zone band + debounce.
+
+        The problem with V4: in choppy/sideways markets, price oscillates
+        around the SMA generating constant whipsaw signals. Each switch
+        loses accumulated dividends.
+
+        Fix: Add a hysteresis band (like a thermostat). Only trigger a
+        switch when price moves DECISIVELY away from the SMA:
+          - Switch to BEAR when price < SMA * (1 - band_pct/100)
+          - Switch to BULL when price > SMA * (1 + band_pct/100)
+          - STAY PUT when price is inside the band
+
+        Still uses debounce on top — price must stay outside the band
+        for N consecutive days before switching.
+
+        band_pct: percentage width on each side of SMA (e.g. 3.0 = ±3%)
+        """
+        analyzer = CounterpartyAnalyzer(windows=self.windows)
+        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
+        common_dates = comparison.index
+
+        calc = TotalReturnCalculator()
+        msty_tri = calc.calculate_total_return_index(msty_df)
+        wntr_tri = calc.calculate_total_return_index(wntr_df)
+
+        # Split-adjusted price and SMA
+        msty_sorted = msty_df.sort_index()
+        if "split" in msty_sorted.columns:
+            cum_split = msty_sorted["split"].replace(0, 1).cumprod()
+            final_split = cum_split.iloc[-1]
+            split_adj = cum_split / final_split
+            adj_price = msty_sorted["close"] / split_adj
+        else:
+            adj_price = msty_sorted["close"]
+
+        sma = adj_price.rolling(window=sma_period, min_periods=sma_period).mean()
+
+        band_mult = band_pct / 100.0
+
+        # Raw signal with hysteresis: only signal a change when outside the band
+        # "HOLD" means stay with current position (inside the band)
+        raw_signal = pd.Series("HOLD", index=common_dates)
+        for date in common_dates:
+            if date in adj_price.index and date in sma.index and not pd.isna(sma[date]):
+                price = adj_price[date]
+                sma_val = sma[date]
+                upper = sma_val * (1 + band_mult)
+                lower = sma_val * (1 - band_mult)
+
+                if price > upper:
+                    raw_signal[date] = "BULL"
+                elif price < lower:
+                    raw_signal[date] = "BEAR"
+                # else: stays "HOLD" — inside the band, no opinion
+
+        # Debounce with hysteresis: only switch when signal persists outside band
+        positions = pd.Series("MSTY", index=common_dates)
+        current = "MSTY"
+        pending = None
+        count = 0
+
+        for date in common_dates:
+            sig = raw_signal[date]
+
+            if sig == "HOLD":
+                # Inside the band — stay put, reset any pending switch
+                pending = None
+                count = 0
+            else:
+                suggested = "MSTY" if sig == "BULL" else "WNTR"
+                if suggested != current:
+                    if suggested == pending:
+                        count += 1
+                    else:
+                        pending = suggested
+                        count = 1
+                    if count >= debounce_days:
+                        current = suggested
+                        pending = None
+                        count = 0
+                else:
+                    pending = None
+                    count = 0
+
+            positions[date] = current
+
+        return self._run_rotation(
+            f"V5: SMA({sma_period}) ±{band_pct}% + Debounce({debounce_days}d)",
+            positions, msty_df, wntr_df, msty_tri, wntr_tri, common_dates,
+        )
+
+
 class RotationVisualizer:
     """Charts for the rotation strategy comparison."""
 
