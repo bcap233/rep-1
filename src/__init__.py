@@ -19,6 +19,11 @@ from .counterparty_analysis import (
     CounterpartyAnalyzer,
     CounterpartyVisualizer,
 )
+from .dividend_analysis import (
+    DividendAnalyzer,
+    DividendVisualizer,
+    DividendPayment,
+)
 
 __all__ = [
     "DataFetcher",
@@ -37,4 +42,7 @@ __all__ = [
     "TotalReturnCalculator",
     "CounterpartyAnalyzer",
     "CounterpartyVisualizer",
+    "DividendAnalyzer",
+    "DividendVisualizer",
+    "DividendPayment",
 ]
