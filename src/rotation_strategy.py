@@ -411,26 +411,8 @@ class RotationBacktester:
             positions, msty_df, wntr_df, msty_tri, wntr_tri, common_dates,
         )
 
-    def run_v4_sma_plus_debounce(
-        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
-        sma_period: int = 50,
-        debounce_days: int = 3,
-    ) -> RotationResult:
-        """
-        V4 Combined: SMA lead signal + debounce filter.
-
-        Only switch when MSTY crosses its SMA AND stays there for N days.
-        Best of both: fast detection + whipsaw protection.
-        """
-        analyzer = CounterpartyAnalyzer(windows=self.windows)
-        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
-        common_dates = comparison.index
-
-        calc = TotalReturnCalculator()
-        msty_tri = calc.calculate_total_return_index(msty_df)
-        wntr_tri = calc.calculate_total_return_index(wntr_df)
-
-        # Split-adjusted MSTY price and SMA
+    def _get_adj_price_and_sma(self, msty_df: pd.DataFrame, sma_period: int):
+        """Compute split-adjusted price and SMA for the bull instrument."""
         msty_sorted = msty_df.sort_index()
         if "split" in msty_sorted.columns:
             cum_split = msty_sorted["split"].replace(0, 1).cumprod()
@@ -441,16 +423,59 @@ class RotationBacktester:
             adj_price = msty_sorted["close"]
 
         sma = adj_price.rolling(window=sma_period, min_periods=sma_period).mean()
+        return adj_price, sma
+
+    def _trim_to_signal_start(self, common_dates, adj_price, sma):
+        """Trim dates to start from first valid SMA date (no blind period)."""
+        sma_valid = sma.dropna()
+        if len(sma_valid) == 0:
+            return common_dates
+        first_sma_date = sma_valid.index[0]
+        return common_dates[common_dates >= first_sma_date]
+
+    def _initial_position_from_sma(self, adj_price, sma, start_date):
+        """Determine correct initial position from SMA on start date."""
+        price = adj_price[start_date]
+        sma_val = sma[start_date]
+        return "WNTR" if price < sma_val else "MSTY"
+
+    def run_v4_sma_plus_debounce(
+        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
+        sma_period: int = 50,
+        debounce_days: int = 3,
+    ) -> RotationResult:
+        """
+        V4 Combined: SMA lead signal + debounce filter.
+
+        Only switch when MSTY crosses its SMA AND stays there for N days.
+        Best of both: fast detection + whipsaw protection.
+
+        Starts from first valid SMA date — no blind period.
+        Initial position is set by the signal, not defaulted to bull.
+        """
+        analyzer = CounterpartyAnalyzer(windows=self.windows)
+        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
+        all_dates = comparison.index
+
+        calc = TotalReturnCalculator()
+        msty_tri = calc.calculate_total_return_index(msty_df)
+        wntr_tri = calc.calculate_total_return_index(wntr_df)
+
+        adj_price, sma = self._get_adj_price_and_sma(msty_df, sma_period)
+
+        # Trim to signal start — no blind period
+        common_dates = self._trim_to_signal_start(all_dates, adj_price, sma)
+        initial = self._initial_position_from_sma(adj_price, sma, common_dates[0])
 
         # Raw SMA signal per day
-        raw_pos = pd.Series("MSTY", index=common_dates)
+        raw_pos = pd.Series(initial, index=common_dates)
         for date in common_dates:
             if date in adj_price.index and date in sma.index and not pd.isna(sma[date]):
                 raw_pos[date] = "WNTR" if adj_price[date] < sma[date] else "MSTY"
 
-        # Debounce
-        positions = pd.Series("MSTY", index=common_dates)
-        current = "MSTY"
+        # Debounce — start with signal-correct position
+        positions = pd.Series(initial, index=common_dates)
+        current = initial
         pending = None
         count = 0
 
@@ -499,27 +524,24 @@ class RotationBacktester:
         Still uses debounce on top — price must stay outside the band
         for N consecutive days before switching.
 
+        Starts from first valid SMA date — no blind period.
+        Initial position is set by the signal, not defaulted to bull.
+
         band_pct: percentage width on each side of SMA (e.g. 3.0 = ±3%)
         """
         analyzer = CounterpartyAnalyzer(windows=self.windows)
         comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
-        common_dates = comparison.index
+        all_dates = comparison.index
 
         calc = TotalReturnCalculator()
         msty_tri = calc.calculate_total_return_index(msty_df)
         wntr_tri = calc.calculate_total_return_index(wntr_df)
 
-        # Split-adjusted price and SMA
-        msty_sorted = msty_df.sort_index()
-        if "split" in msty_sorted.columns:
-            cum_split = msty_sorted["split"].replace(0, 1).cumprod()
-            final_split = cum_split.iloc[-1]
-            split_adj = cum_split / final_split
-            adj_price = msty_sorted["close"] / split_adj
-        else:
-            adj_price = msty_sorted["close"]
+        adj_price, sma = self._get_adj_price_and_sma(msty_df, sma_period)
 
-        sma = adj_price.rolling(window=sma_period, min_periods=sma_period).mean()
+        # Trim to signal start — no blind period
+        common_dates = self._trim_to_signal_start(all_dates, adj_price, sma)
+        initial = self._initial_position_from_sma(adj_price, sma, common_dates[0])
 
         band_mult = band_pct / 100.0
 
@@ -539,9 +561,9 @@ class RotationBacktester:
                     raw_signal[date] = "BEAR"
                 # else: stays "HOLD" — inside the band, no opinion
 
-        # Debounce with hysteresis: only switch when signal persists outside band
-        positions = pd.Series("MSTY", index=common_dates)
-        current = "MSTY"
+        # Debounce with hysteresis — start with signal-correct position
+        positions = pd.Series(initial, index=common_dates)
+        current = initial
         pending = None
         count = 0
 
