@@ -30,6 +30,12 @@ from .strategy_backtest import (
     StrategyResult,
     Trade,
 )
+from .rotation_strategy import (
+    RotationBacktester,
+    RotationVisualizer,
+    RotationResult,
+    RotationTrade,
+)
 
 __all__ = [
     "DataFetcher",
@@ -55,4 +61,8 @@ __all__ = [
     "StrategyVisualizer",
     "StrategyResult",
     "Trade",
+    "RotationBacktester",
+    "RotationVisualizer",
+    "RotationResult",
+    "RotationTrade",
 ]

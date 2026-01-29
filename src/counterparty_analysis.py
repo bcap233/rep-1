@@ -39,9 +39,14 @@ class TotalReturnCalculator:
         Create a total return index that accounts for dividends.
 
         Starts at 1.0 on the first day. Each day:
-        - Adjusts for splits
         - Adds dividend yield (dividend / price on ex-date)
         - Compounds price returns
+
+        IMPORTANT: Prices in the data are assumed to be continuous
+        (no split discontinuity). The split column is metadata indicating
+        when a split occurred. Post-split dividends are per-new-share,
+        so they must be multiplied by the cumulative split factor to get
+        per-original-share dividend income.
 
         Args:
             df: DataFrame with price, dividend, and split data (oldest first)
@@ -55,25 +60,24 @@ class TotalReturnCalculator:
         result = df.copy()
         result = result.sort_index()  # Ensure oldest first
 
-        # First, create split-adjusted prices working backwards
-        # The split column contains the split ratio on the split date
-        if split_col in result.columns:
-            cumulative_split = result[split_col].replace(0, 1).cumprod()
-            # Normalize so the last value = 1 (current prices are "real")
-            final_split = cumulative_split.iloc[-1]
-            split_adjustment = cumulative_split / final_split
-            adjusted_price = result[price_col] / split_adjustment
-        else:
-            adjusted_price = result[price_col].copy()
+        # Prices are already continuous (no split adjustment needed)
+        price = result[price_col].copy()
 
         # Calculate daily price returns
-        daily_price_return = adjusted_price.pct_change()
+        daily_price_return = price.pct_change()
 
         # Calculate dividend yield on each day
         if dividend_col in result.columns:
-            # Dividend yield = dividend / price on ex-date
-            # For split-adjusted: use adjusted price
-            dividend_yield = result[dividend_col] / adjusted_price
+            dividends = result[dividend_col].fillna(0).copy()
+
+            # Adjust dividends for splits: post-split dividends are per-new-share,
+            # multiply by cumulative split factor to get per-original-share income
+            if split_col in result.columns:
+                cumulative_split = result[split_col].replace(0, 1).cumprod()
+                dividends = dividends * cumulative_split
+
+            # Dividend yield = adjusted dividend / price
+            dividend_yield = dividends / price
             dividend_yield = dividend_yield.fillna(0)
         else:
             dividend_yield = pd.Series(0, index=result.index)
