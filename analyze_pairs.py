@@ -51,9 +51,9 @@ PAIRS = [
     },
     {
         "name": "Coinbase",
-        "bull": "COIN",
+        "bull": "CONY",
         "bear": "FIAT",
-        "bull_csv": "coin_data_with_dividends.csv",
+        "bull_csv": "cony_data_with_dividends.csv",
         "bear_csv": "fiat_data_with_dividends.csv",
     },
     {
