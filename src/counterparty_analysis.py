@@ -160,8 +160,9 @@ class CounterpartyAnalyzer:
         msty_rolling = self.calc.calculate_rolling_total_returns(msty_tri, self.windows)
         wntr_rolling = self.calc.calculate_rolling_total_returns(wntr_tri, self.windows)
 
-        # Build comparison dataframe
-        comparison = pd.DataFrame(index=msty_df.sort_index().index)
+        # Build comparison dataframe on intersection of dates
+        common_dates = msty_df.sort_index().index.intersection(wntr_df.sort_index().index)
+        comparison = pd.DataFrame(index=common_dates)
 
         # Prices
         comparison["msty_price"] = msty_df.sort_index()[msty_price_col]

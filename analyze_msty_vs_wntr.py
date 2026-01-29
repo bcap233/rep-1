@@ -7,10 +7,7 @@ to identify divergence patterns. As MSTY's rolling total returns go negative
 on increasingly more timeframes (5d -> 10d -> 20d), WNTR's should go positive —
 revealing the reflexive collapse in action.
 
-WNTR DATA NOTE:
-    WNTR data in this script is SYNTHETIC — modeled as an inverse instrument
-    to MSTY based on MSTY's daily returns. Replace wntr_data_with_dividends.csv
-    with real market data when available.
+Uses real market data for both instruments from CSV files.
 """
 
 import sys
@@ -125,28 +122,32 @@ def run_analysis():
     print(f"  Price range: ${msty_df['close'].min():.2f} - ${msty_df['close'].max():.2f}")
     print(f"  Total dividends: ${msty_df['dividend'].sum():.2f}")
 
-    # Generate or load WNTR data
+    # Load WNTR data
     wntr_csv = Path("wntr_data_with_dividends.csv")
     if wntr_csv.exists():
         wntr_df = pd.read_csv(wntr_csv, parse_dates=["Date"], index_col="Date")
         wntr_df = wntr_df.sort_index()
         wntr_df.columns = [c.lower().strip() for c in wntr_df.columns]
-        print("\n  [Loaded WNTR data from wntr_data_with_dividends.csv]")
+        print("\n  [Loaded real WNTR data from wntr_data_with_dividends.csv]")
     else:
-        print("\n  [No WNTR CSV found — generating SYNTHETIC inverse data]")
-        print("  NOTE: Replace with real WNTR data for production analysis")
-        wntr_df = generate_synthetic_wntr(msty_df)
-
-        # Save for inspection
-        save_df = wntr_df.copy()
-        save_df.index.name = "Date"
-        save_df.columns = ["Close", "Dividend", "Split"]
-        save_df.to_csv("wntr_data_with_dividends.csv")
-        print("  Saved synthetic data to wntr_data_with_dividends.csv")
+        print("\n  ERROR: wntr_data_with_dividends.csv not found.")
+        print("  Please provide WNTR price/dividend data.")
+        return
 
     print(f"\nWNTR: {wntr_df.index[0].date()} to {wntr_df.index[-1].date()} ({len(wntr_df)} days)")
     print(f"  Price range: ${wntr_df['close'].min():.2f} - ${wntr_df['close'].max():.2f}")
     print(f"  Total dividends: ${wntr_df['dividend'].sum():.2f}")
+
+    # Align to overlapping date range
+    overlap_start = max(msty_df.index.min(), wntr_df.index.min())
+    overlap_end = min(msty_df.index.max(), wntr_df.index.max())
+
+    msty_df = msty_df.loc[overlap_start:overlap_end]
+    wntr_df = wntr_df.loc[overlap_start:overlap_end]
+
+    print(f"\n  Overlapping period: {overlap_start.date()} to {overlap_end.date()}")
+    print(f"  MSTY days in overlap: {len(msty_df)}")
+    print(f"  WNTR days in overlap: {len(wntr_df)}")
 
     # ================================================================
     # TOTAL RETURN INDICES
