@@ -14,6 +14,11 @@ from .returns_analysis import (
     RollingReturnsAnalyzer,
     RollingReturnsVisualizer,
 )
+from .counterparty_analysis import (
+    TotalReturnCalculator,
+    CounterpartyAnalyzer,
+    CounterpartyVisualizer,
+)
 
 __all__ = [
     "DataFetcher",
@@ -29,4 +34,7 @@ __all__ = [
     "RegimeStats",
     "RollingReturnsAnalyzer",
     "RollingReturnsVisualizer",
+    "TotalReturnCalculator",
+    "CounterpartyAnalyzer",
+    "CounterpartyVisualizer",
 ]
