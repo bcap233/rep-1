@@ -851,6 +851,127 @@ class RotationBacktester:
         )
 
 
+    def run_v6c_rv_veto(
+        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
+        sma_period: int = 50,
+        band_pct: float = 5.0,
+        debounce_days: int = 3,
+        rv_window: int = 20,
+        rv_lookback: int = 60,
+        rv_veto_pctile: float = 60.0,
+    ) -> RotationResult:
+        """
+        V6c RV-Veto: V5 rules + block bear switch during high vol.
+
+        Same as V5 (±5% band, 3-day debounce), but with one addition:
+        When the signal says "switch to bear" (bull ETF breached below
+        the band), check the current RV percentile. If RV is above the
+        veto threshold (e.g. 60th percentile), BLOCK the switch. The
+        breach is likely a vol spike, not a grinding collapse. Stay
+        in the bull ETF and keep collecting income.
+
+        The veto only applies to bull→bear switches. Bear→bull switches
+        proceed normally — we always want to catch the recovery.
+
+        rv_veto_pctile: percentile threshold above which bear switches
+                        are blocked (60 = block when RV > 60th pctile)
+        rv_lookback: trailing days for computing RV percentile
+        """
+        analyzer = CounterpartyAnalyzer(windows=self.windows)
+        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
+        all_dates = comparison.index
+
+        calc = TotalReturnCalculator()
+        msty_tri = calc.calculate_total_return_index(msty_df)
+        wntr_tri = calc.calculate_total_return_index(wntr_df)
+
+        adj_price, sma = self._get_adj_price_and_sma(msty_df, sma_period)
+
+        # Compute RV
+        log_ret = np.log(adj_price / adj_price.shift(1))
+        rv = log_ret.rolling(rv_window).std() * np.sqrt(252) * 100
+
+        # Trim to signal start — need both SMA and RV
+        sma_valid = sma.dropna()
+        rv_valid = rv.dropna()
+        if len(sma_valid) == 0 or len(rv_valid) == 0:
+            common_dates = all_dates
+        else:
+            first_valid = max(sma_valid.index[0], rv_valid.index[0])
+            common_dates = all_dates[all_dates >= first_valid]
+
+        initial = self._initial_position_from_sma(adj_price, sma, common_dates[0])
+
+        band_mult = band_pct / 100.0
+
+        # Raw signal — same as V5
+        raw_signal = pd.Series("HOLD", index=common_dates)
+        for date in common_dates:
+            if date in adj_price.index and date in sma.index and not pd.isna(sma[date]):
+                price = adj_price[date]
+                sma_val = sma[date]
+                upper = sma_val * (1 + band_mult)
+                lower = sma_val * (1 - band_mult)
+                if price > upper:
+                    raw_signal[date] = "BULL"
+                elif price < lower:
+                    raw_signal[date] = "BEAR"
+
+        # Debounce + RV veto on bear switches
+        positions = pd.Series(initial, index=common_dates)
+        current = initial
+        pending = None
+        count = 0
+
+        for date in common_dates:
+            sig = raw_signal[date]
+
+            if sig == "HOLD":
+                pending = None
+                count = 0
+            else:
+                suggested = "MSTY" if sig == "BULL" else "WNTR"
+                if suggested != current:
+                    if suggested == pending:
+                        count += 1
+                    else:
+                        pending = suggested
+                        count = 1
+
+                    if count >= debounce_days:
+                        # Debounce passed — but check RV veto for bear switches
+                        execute_switch = True
+
+                        if suggested == "WNTR" and current == "MSTY":
+                            # Bull→bear switch: check RV veto
+                            if date in rv.index and not pd.isna(rv[date]):
+                                rv_loc = rv.index.get_loc(date)
+                                start_loc = max(0, rv_loc - rv_lookback)
+                                rv_window_data = rv.iloc[start_loc:rv_loc + 1].dropna()
+                                if len(rv_window_data) >= 20:
+                                    rv_pctile = (rv_window_data < rv[date]).mean() * 100
+                                    if rv_pctile > rv_veto_pctile:
+                                        execute_switch = False
+                                        # Reset pending — vetoed, wait for low vol
+                                        pending = None
+                                        count = 0
+
+                        if execute_switch:
+                            current = suggested
+                            pending = None
+                            count = 0
+                else:
+                    pending = None
+                    count = 0
+
+            positions[date] = current
+
+        return self._run_rotation(
+            f"V6c: SMA({sma_period}) ±{band_pct}% + Debounce({debounce_days}d) + RV-Veto(>{rv_veto_pctile:.0f}th)",
+            positions, msty_df, wntr_df, msty_tri, wntr_tri, common_dates,
+        )
+
+
 class RotationVisualizer:
     """Charts for the rotation strategy comparison."""
 
