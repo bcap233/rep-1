@@ -598,6 +598,259 @@ class RotationBacktester:
         )
 
 
+    def run_v6_rv_adaptive(
+        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
+        sma_period: int = 50,
+        rv_window: int = 20,
+        band_scalar: float = 10.0,
+        band_floor: float = 2.0,
+        band_cap: float = 12.0,
+        debounce_days: int = 3,
+    ) -> RotationResult:
+        """
+        V6 RV-Adaptive Hysteresis: SMA + volatility-scaled band + debounce.
+
+        The problem with V5's fixed band: ±5% means different things at
+        different volatility levels. When RV is 30% (ann), ±5% is a
+        ~2.6σ daily event — very significant. When RV is 80%, ±5% is
+        only ~1σ — noise. The band should scale so a breach always
+        carries the same statistical weight.
+
+        Fix: Band width = RV(20d, annualized) / band_scalar.
+          - RV = 30% → band = ±3.0%
+          - RV = 50% → band = ±5.0%
+          - RV = 80% → band = ±8.0%
+
+        This means a breach is always ~1.6 daily standard deviations
+        regardless of vol regime. Low vol grinds get tighter bands
+        (faster switching). High vol spikes get wider bands (more patience).
+
+        Parameters:
+          band_scalar: divisor for RV→band conversion (10 = band is RV/10)
+          band_floor: minimum band width % (prevents band from collapsing)
+          band_cap: maximum band width % (prevents band from being too wide)
+          rv_window: days for realized vol calculation
+          debounce_days: consecutive days signal must persist outside band
+
+        Starts from first valid SMA date — no blind period.
+        Initial position is set by the signal, not defaulted to bull.
+        """
+        analyzer = CounterpartyAnalyzer(windows=self.windows)
+        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
+        all_dates = comparison.index
+
+        calc = TotalReturnCalculator()
+        msty_tri = calc.calculate_total_return_index(msty_df)
+        wntr_tri = calc.calculate_total_return_index(wntr_df)
+
+        adj_price, sma = self._get_adj_price_and_sma(msty_df, sma_period)
+
+        # Compute realized volatility (annualized) from bull ETF
+        log_ret = np.log(adj_price / adj_price.shift(1))
+        rv = log_ret.rolling(rv_window).std() * np.sqrt(252) * 100  # as percentage
+
+        # Trim to signal start — no blind period
+        # Need both SMA and RV to be valid
+        sma_valid = sma.dropna()
+        rv_valid = rv.dropna()
+        if len(sma_valid) == 0 or len(rv_valid) == 0:
+            common_dates = all_dates
+        else:
+            first_valid = max(sma_valid.index[0], rv_valid.index[0])
+            common_dates = all_dates[all_dates >= first_valid]
+
+        initial = self._initial_position_from_sma(adj_price, sma, common_dates[0])
+
+        # Raw signal with RV-adaptive hysteresis band
+        raw_signal = pd.Series("HOLD", index=common_dates)
+        daily_band = pd.Series(np.nan, index=common_dates)
+
+        for date in common_dates:
+            if (date in adj_price.index and date in sma.index
+                    and not pd.isna(sma[date])
+                    and date in rv.index and not pd.isna(rv[date])):
+                price = adj_price[date]
+                sma_val = sma[date]
+                rv_val = rv[date]
+
+                # Adaptive band: RV / scalar, clamped to [floor, cap]
+                band_pct = max(band_floor, min(band_cap, rv_val / band_scalar))
+                daily_band[date] = band_pct
+                band_mult = band_pct / 100.0
+
+                upper = sma_val * (1 + band_mult)
+                lower = sma_val * (1 - band_mult)
+
+                if price > upper:
+                    raw_signal[date] = "BULL"
+                elif price < lower:
+                    raw_signal[date] = "BEAR"
+                # else: HOLD — inside the adaptive band
+
+        # Debounce — same logic as V5
+        positions = pd.Series(initial, index=common_dates)
+        current = initial
+        pending = None
+        count = 0
+
+        for date in common_dates:
+            sig = raw_signal[date]
+
+            if sig == "HOLD":
+                pending = None
+                count = 0
+            else:
+                suggested = "MSTY" if sig == "BULL" else "WNTR"
+                if suggested != current:
+                    if suggested == pending:
+                        count += 1
+                    else:
+                        pending = suggested
+                        count = 1
+                    if count >= debounce_days:
+                        current = suggested
+                        pending = None
+                        count = 0
+                else:
+                    pending = None
+                    count = 0
+
+            positions[date] = current
+
+        avg_band = daily_band.dropna().mean()
+        return self._run_rotation(
+            f"V6: SMA({sma_period}) RV-Band(avg±{avg_band:.1f}%) + Debounce({debounce_days}d)",
+            positions, msty_df, wntr_df, msty_tri, wntr_tri, common_dates,
+        )
+
+
+    def run_v6b_rv_debounce(
+        self, msty_df: pd.DataFrame, wntr_df: pd.DataFrame,
+        sma_period: int = 50,
+        band_pct: float = 5.0,
+        rv_window: int = 20,
+        low_rv_pctile: float = 40.0,
+        high_rv_pctile: float = 60.0,
+        debounce_low_rv: int = 2,
+        debounce_mid_rv: int = 3,
+        debounce_high_rv: int = 5,
+    ) -> RotationResult:
+        """
+        V6b RV-Adaptive Debounce: Fixed band + vol-scaled confirmation.
+
+        Keeps V5's ±5% band (which works well as an absolute threshold)
+        but adjusts how long the signal must persist before switching,
+        based on realized volatility regime:
+
+          - Low RV (calm grind, <40th pctile): debounce=2 days
+            The move is persistent and directional — act quickly.
+          - Mid RV (normal, 40-60th pctile): debounce=3 days
+            Standard confirmation.
+          - High RV (vol spike, >60th pctile): debounce=5 days
+            The move is likely a spike — require more proof.
+
+        RV percentile is computed on a trailing 60-day window.
+        """
+        analyzer = CounterpartyAnalyzer(windows=self.windows)
+        comparison = analyzer.prepare_comparison_data(msty_df, wntr_df)
+        all_dates = comparison.index
+
+        calc = TotalReturnCalculator()
+        msty_tri = calc.calculate_total_return_index(msty_df)
+        wntr_tri = calc.calculate_total_return_index(wntr_df)
+
+        adj_price, sma = self._get_adj_price_and_sma(msty_df, sma_period)
+
+        # Compute RV
+        log_ret = np.log(adj_price / adj_price.shift(1))
+        rv = log_ret.rolling(rv_window).std() * np.sqrt(252) * 100
+
+        # Trim to signal start — need both SMA and RV
+        sma_valid = sma.dropna()
+        rv_valid = rv.dropna()
+        if len(sma_valid) == 0 or len(rv_valid) == 0:
+            common_dates = all_dates
+        else:
+            first_valid = max(sma_valid.index[0], rv_valid.index[0])
+            common_dates = all_dates[all_dates >= first_valid]
+
+        initial = self._initial_position_from_sma(adj_price, sma, common_dates[0])
+
+        band_mult = band_pct / 100.0
+
+        # Raw signal with fixed hysteresis band (same as V5)
+        raw_signal = pd.Series("HOLD", index=common_dates)
+        for date in common_dates:
+            if date in adj_price.index and date in sma.index and not pd.isna(sma[date]):
+                price = adj_price[date]
+                sma_val = sma[date]
+                upper = sma_val * (1 + band_mult)
+                lower = sma_val * (1 - band_mult)
+
+                if price > upper:
+                    raw_signal[date] = "BULL"
+                elif price < lower:
+                    raw_signal[date] = "BEAR"
+
+        # RV-adaptive debounce
+        positions = pd.Series(initial, index=common_dates)
+        current = initial
+        pending = None
+        count = 0
+
+        # Trailing window for RV percentile
+        rv_lookback = 60  # trading days
+
+        for date in common_dates:
+            sig = raw_signal[date]
+
+            # Determine debounce days based on RV percentile
+            if date in rv.index and not pd.isna(rv[date]):
+                # Get trailing RV window
+                rv_loc = rv.index.get_loc(date)
+                start_loc = max(0, rv_loc - rv_lookback)
+                rv_window_data = rv.iloc[start_loc:rv_loc + 1].dropna()
+
+                if len(rv_window_data) >= 20:
+                    rv_pctile = (rv_window_data < rv[date]).mean() * 100
+                    if rv_pctile < low_rv_pctile:
+                        debounce_req = debounce_low_rv
+                    elif rv_pctile > high_rv_pctile:
+                        debounce_req = debounce_high_rv
+                    else:
+                        debounce_req = debounce_mid_rv
+                else:
+                    debounce_req = debounce_mid_rv
+            else:
+                debounce_req = debounce_mid_rv
+
+            if sig == "HOLD":
+                pending = None
+                count = 0
+            else:
+                suggested = "MSTY" if sig == "BULL" else "WNTR"
+                if suggested != current:
+                    if suggested == pending:
+                        count += 1
+                    else:
+                        pending = suggested
+                        count = 1
+                    if count >= debounce_req:
+                        current = suggested
+                        pending = None
+                        count = 0
+                else:
+                    pending = None
+                    count = 0
+
+            positions[date] = current
+
+        return self._run_rotation(
+            f"V6b: SMA({sma_period}) ±{band_pct}% + RV-Debounce({debounce_low_rv}/{debounce_mid_rv}/{debounce_high_rv}d)",
+            positions, msty_df, wntr_df, msty_tri, wntr_tri, common_dates,
+        )
+
+
 class RotationVisualizer:
     """Charts for the rotation strategy comparison."""
 
