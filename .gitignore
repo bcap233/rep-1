@@ -45,6 +45,10 @@ output/
 .DS_Store
 Thumbs.db
 
+# Bot runtime state
+bot/state.json
+bot/bot.log
+
 # Secrets
 .env
 *.env
