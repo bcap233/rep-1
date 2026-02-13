@@ -179,6 +179,65 @@ EXECUTION = {
 }
 
 # ============================================================
+# STRATEGY: HIGH PROBABILITY GRINDER
+# ============================================================
+# Buy YES tokens on events priced >90% at scale.
+# Profit per win is small (5-10c) but win rate is very high.
+
+HIGH_PROB_GRINDER = {
+    # Only buy YES tokens priced in this range
+    "min_probability": 0.90,
+    "max_probability": 0.97,
+    # Sweet spot: best risk/reward zone
+    "sweet_spot_low": 0.91,
+    "sweet_spot_high": 0.95,
+    # Market quality filters
+    "min_liquidity": 5_000,
+    "min_volume": 10_000,
+    "max_spread": 0.04,
+    "min_ask_depth": 50,
+    # Fixed size per trade (USDC). Many small bets.
+    "size_per_trade_usdc": 20.0,
+    # Strategy-level position limits
+    "max_positions": 50,
+    "max_exposure_usdc": 2_000.0,
+    # Time-to-expiry window
+    "min_hours_to_expiry": 2,
+    "max_days_to_expiry": 30,
+    # Number of markets to scan per cycle
+    "scan_limit": 200,
+    # Minimum positive EV per share
+    "min_edge": 0.01,
+}
+
+# ============================================================
+# STRATEGY: BILATERAL ARBITRAGE
+# ============================================================
+# Buy both sides (YES + NO, or all outcomes) when the total
+# cost is less than $1.00, locking in risk-free profit.
+
+BILATERAL_ARB = {
+    # Minimum gap after fees to execute each arb type
+    "min_gap_intra": 0.02,   # Same-market YES+NO arb
+    "min_gap_cross": 0.03,   # Cross-market complementary arb
+    "min_gap_multi": 0.04,   # Multi-outcome bracket arb
+    # Polymarket fee rate on winnings
+    "fee_rate": 0.02,
+    # Per-side quality requirements
+    "min_liquidity_per_side": 2_000,
+    "min_depth_per_side": 20,
+    "max_spread_per_side": 0.05,
+    # Position limits
+    "max_positions": 20,
+    "size_per_leg_usdc": 50.0,
+    "max_exposure_usdc": 2_000.0,
+    # Scan size
+    "scan_limit": 200,
+    # Max time gap between complementary market expirations
+    "max_expiry_gap_hours": 24,
+}
+
+# ============================================================
 # NOTIFICATIONS
 # ============================================================
 

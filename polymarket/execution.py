@@ -204,6 +204,9 @@ class ExecutionEngine:
         """
         Execute a signal: validate risk, place order, track position.
 
+        Handles both single-leg signals (spot divergence, grinder)
+        and multi-leg bilateral arb signals.
+
         Returns the Position if opened, None if rejected or failed.
         """
         # Risk check
@@ -212,6 +215,14 @@ class ExecutionEngine:
             logger.info(f"Signal rejected: {reason}")
             return None
 
+        # Dispatch to bilateral handler if multi-leg
+        if signal.is_bilateral:
+            return self._execute_bilateral(signal)
+
+        return self._execute_single_leg(signal)
+
+    def _execute_single_leg(self, signal: Signal) -> Optional[Position]:
+        """Execute a standard single-leg signal."""
         mode = EXECUTION["mode"]
         price = signal.suggested_price
         size = signal.suggested_size
@@ -267,6 +278,83 @@ class ExecutionEngine:
             stop_loss_price=max(0.01, price - RISK["stop_loss"]) if signal.side == "BUY" else min(0.99, price + RISK["stop_loss"]),
             take_profit_price=min(0.99, price + RISK["take_profit"]) if signal.side == "BUY" else max(0.01, price - RISK["take_profit"]),
             max_hold_until=now + RISK["max_hold_minutes"] * 60,
+        )
+
+        self.state.positions.append(position)
+        self.state.daily_trades += 1
+        self._log_trade(position, "OPEN")
+        self._save_state()
+
+        return position
+
+    def _execute_bilateral(self, signal: Signal) -> Optional[Position]:
+        """
+        Execute a bilateral arb: buy all legs simultaneously.
+
+        For a YES+NO arb, we place two orders (buy YES, buy NO).
+        For a multi-outcome arb, we place N orders (one per outcome).
+        All legs must fill for the arb to be complete.
+        """
+        mode = EXECUTION["mode"]
+        legs = signal.arb_legs
+        size = signal.suggested_size
+
+        total_cost = sum(leg["price"] * size for leg in legs)
+        guaranteed_payout = size  # One leg resolves to $1.00 * size
+
+        logger.info(f"{'[PAPER] ' if mode == 'paper' else ''}"
+                     f"Executing BILATERAL ({len(legs)} legs): "
+                     f"{size} shares each | total cost=${total_cost:.2f} → "
+                     f"guaranteed=${guaranteed_payout:.2f} | "
+                     f"profit=${guaranteed_payout - total_cost:.2f}")
+
+        order_ids = []
+
+        for i, leg in enumerate(legs):
+            leg_label = leg.get("label", f"Leg {i}")
+            leg_price = leg["price"]
+            leg_token = leg["token_id"]
+
+            logger.info(f"  Leg {i+1}/{len(legs)}: BUY {size} {leg_label} "
+                         f"@ ${leg_price:.2f}")
+
+            if mode == "live":
+                order = self.client.place_order(
+                    token_id=leg_token,
+                    side="BUY",
+                    price=leg_price,
+                    size=size,
+                )
+                if not order:
+                    logger.error(f"  Leg {i+1} FAILED — arb incomplete!")
+                    # In production, you'd cancel all previous legs here.
+                    # For now, log the partial fill.
+                    order_ids.append(f"FAILED_leg{i}")
+                else:
+                    order_ids.append(order.order_id)
+            else:
+                order_ids.append(f"paper_leg{i}_{int(time.time())}")
+
+        # Track as a single combined position
+        now = time.time()
+        position = Position(
+            position_id=self._next_position_id(),
+            asset=signal.asset,
+            market_question=signal.market.question,
+            condition_id=signal.market.condition_id,
+            token_id=signal.token_id,  # Primary leg token
+            token_side=signal.token_side,
+            side="BUY",
+            entry_price=round(sum(l["price"] for l in legs), 4),
+            entry_size=size,
+            entry_cost=total_cost,
+            entry_time=now,
+            entry_order_id="|".join(order_ids),
+            current_price=signal.suggested_price,
+            # Bilateral arbs don't use stop/TP — they're held to resolution
+            stop_loss_price=0.0,
+            take_profit_price=0.0,
+            max_hold_until=0,  # Hold until market resolves
         )
 
         self.state.positions.append(position)

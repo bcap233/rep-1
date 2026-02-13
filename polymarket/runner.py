@@ -3,22 +3,25 @@
 Polymarket Arbitrage Bot — Main Runner.
 
 Usage:
-    python -m polymarket                      # Run one scan cycle
-    python -m polymarket --loop               # Run continuously
-    python -m polymarket --loop --interval 15 # Custom poll interval (seconds)
-    python -m polymarket --assets BTC,ETH     # Specific assets only
-    python -m polymarket --markets            # List available markets
-    python -m polymarket --status             # Show open positions
-    python -m polymarket --close-all          # Close all positions
-    python -m polymarket --paper              # Force paper mode
-    python -m polymarket --live               # Force live mode (requires API keys)
+    python -m polymarket                                    # Run one scan (all strategies)
+    python -m polymarket --loop                             # Run continuously
+    python -m polymarket --strategy spot_divergence --loop  # Single strategy
+    python -m polymarket --strategy high_prob_grinder       # Grinder only
+    python -m polymarket --strategy bilateral_arb           # Bilateral arb only
+    python -m polymarket --strategy all --loop              # All strategies (default)
+    python -m polymarket --assets BTC,ETH                   # Specific assets
+    python -m polymarket --markets                          # List available markets
+    python -m polymarket --status                           # Show open positions
+    python -m polymarket --close-all                        # Close all positions
+    python -m polymarket --strategies                       # List available strategies
+    python -m polymarket --paper                            # Force paper mode
+    python -m polymarket --live                             # Force live mode
 
-The bot:
-  1. Fetches spot prices from Binance/Coinbase/Kraken
-  2. Builds 5/10/15 minute charts and computes momentum indicators
-  3. Finds relevant Polymarket prediction markets
-  4. Compares spot momentum vs Polymarket implied probabilities
-  5. Places trades when mispricing exceeds threshold
+Strategies:
+    spot_divergence    - Spot momentum vs Polymarket probability lag
+    high_prob_grinder  - Buy >90% events at scale, collect small edges
+    bilateral_arb      - Buy both sides when YES+NO < $1.00
+    all                - Run all strategies each cycle
 """
 
 import argparse
@@ -33,9 +36,10 @@ from pathlib import Path
 from .config import STRATEGY, ASSETS, EXECUTION, RISK, DATA, TIMEFRAMES
 from .exchanges import get_composite_price
 from .polymarket_client import PolymarketClient
-from .signals import generate_signals
+from .signals import Signal, generate_signals
 from .execution import ExecutionEngine
 from .risk import RiskManager
+from .strategies import get_strategy, list_strategies, STRATEGIES, BaseStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,22 +62,49 @@ sys_signal.signal(sys_signal.SIGINT, _handle_signal)
 sys_signal.signal(sys_signal.SIGTERM, _handle_signal)
 
 
-def print_banner():
+# ============================================================
+# Display helpers
+# ============================================================
+
+def print_banner(strategy_names: list[str]):
     print()
     print("=" * 80)
     print("  POLYMARKET ARBITRAGE BOT")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 80)
     print()
-    print(f"  Strategy: Spot momentum vs Polymarket implied probability")
-    print(f"  Timeframes: {', '.join(str(t) + 'm' for t in TIMEFRAMES)}")
-    print(f"  Min edge: {STRATEGY['min_edge']*100:.0f}c | "
-          f"Momentum threshold: {STRATEGY['momentum_threshold_pct']}%")
-    print(f"  Assets: {', '.join(ASSETS.keys())}")
+
+    if len(strategy_names) == 1:
+        name = strategy_names[0]
+        if name in STRATEGIES:
+            print(f"  Strategy: {name} — {STRATEGIES[name].description}")
+        else:
+            print(f"  Strategy: {name}")
+    else:
+        print(f"  Strategies: {', '.join(strategy_names)}")
+        for name in strategy_names:
+            if name in STRATEGIES:
+                print(f"    - {name}: {STRATEGIES[name].description}")
+
     print(f"  Mode: {EXECUTION['mode'].upper()}")
+    print(f"  Assets: {', '.join(ASSETS.keys())}")
     print(f"  Risk: max ${RISK['max_position_usdc']}/trade, "
           f"${RISK['max_total_exposure_usdc']} total, "
           f"SL {RISK['stop_loss']*100:.0f}c / TP {RISK['take_profit']*100:.0f}c")
+    print()
+
+
+def print_strategies():
+    """Print all available strategies."""
+    print()
+    print("  Available Strategies:")
+    print(f"  {'-' * 60}")
+    for name, desc in list_strategies():
+        print(f"  {name:<25} {desc}")
+    print()
+    print(f"  {'all':<25} Run all strategies each cycle")
+    print()
+    print("  Usage: python -m polymarket --strategy <name> [--loop]")
     print()
 
 
@@ -90,26 +121,69 @@ def print_prices(assets: list[str]):
     print()
 
 
-def print_signals(signals):
+def print_signals(signals: list[Signal], strategy_name: str = ""):
     """Print detected signals."""
+    if strategy_name:
+        header = f"  [{strategy_name.upper()}] "
+    else:
+        header = "  "
+
     if not signals:
-        print("  No arbitrage signals detected.")
+        print(f"{header}No signals detected.")
         print()
         return
 
-    print(f"  Found {len(signals)} signal(s):")
+    print(f"{header}Found {len(signals)} signal(s):")
     print()
-    print(f"  {'Asset':<6} {'Side':>8} {'Market':>40} {'Edge':>6} {'Conf':>5} "
-          f"{'Price':>6} {'Size':>5}")
-    print(f"  {'-' * 80}")
 
+    # Group by strategy for multi-strategy runs
+    by_strategy: dict[str, list[Signal]] = {}
     for s in signals:
-        market_short = s.market.question[:38]
-        print(f"  {s.asset:<6} {s.side + ' ' + s.token_side:>8} "
-              f"{market_short:>40} {s.edge:>5.3f} {s.confidence:>5.2f} "
-              f"${s.suggested_price:>4.2f} {s.suggested_size:>5.0f}")
+        strat = getattr(s, 'strategy', 'unknown')
+        by_strategy.setdefault(strat, []).append(s)
 
-    print()
+    for strat, strat_signals in by_strategy.items():
+        if len(by_strategy) > 1:
+            print(f"  --- {strat.upper()} ({len(strat_signals)}) ---")
+
+        # Adapt columns based on strategy type
+        if strat == "bilateral_arb":
+            print(f"  {'Asset':<6} {'Type':>12} {'Market':>35} {'Gap':>6} "
+                  f"{'Cost':>6} {'Profit':>7}")
+            print(f"  {'-' * 78}")
+            for s in strat_signals:
+                market_short = s.market.question[:33]
+                profit = s.edge * s.suggested_size
+                print(f"  {s.asset:<6} {s.token_side:>12} "
+                      f"{market_short:>35} {s.edge:>5.3f} "
+                      f"${s.suggested_price:>4.2f} ${profit:>+5.2f}")
+                # Print legs
+                for leg in s.arb_legs:
+                    print(f"    -> {leg['label'][:30]:<32} @ ${leg['price']:.2f}")
+
+        elif strat == "high_prob_grinder":
+            print(f"  {'Asset':<6} {'Price':>6} {'EV/sh':>7} {'Market':>45} "
+                  f"{'Size':>5}")
+            print(f"  {'-' * 78}")
+            for s in strat_signals:
+                market_short = s.market.question[:43]
+                print(f"  {s.asset:<6} ${s.suggested_price:>4.2f} "
+                      f"${s.edge:>+5.4f} {market_short:>45} "
+                      f"{s.suggested_size:>5.0f}")
+
+        else:  # spot_divergence or unknown
+            print(f"  {'Asset':<6} {'Side':>8} {'Market':>35} {'Edge':>6} "
+                  f"{'Conf':>5} {'Price':>6} {'Size':>5}")
+            print(f"  {'-' * 78}")
+            for s in strat_signals:
+                market_short = s.market.question[:33]
+                print(f"  {s.asset:<6} "
+                      f"{s.side + ' ' + s.token_side:>8} "
+                      f"{market_short:>35} {s.edge:>5.3f} "
+                      f"{s.confidence:>5.2f} "
+                      f"${s.suggested_price:>4.2f} {s.suggested_size:>5.0f}")
+
+        print()
 
 
 def print_positions(engine: ExecutionEngine):
@@ -124,13 +198,15 @@ def print_positions(engine: ExecutionEngine):
         print(f"  Total exposure: ${summary['total_exposure_usdc']:.2f}")
         print(f"  Unrealized PnL: ${summary['unrealized_pnl']:+.2f}")
         print()
-        print(f"  {'ID':<16} {'Asset':<6} {'Side':>8} {'Entry':>6} {'Now':>6} "
+        print(f"  {'ID':<16} {'Asset':<6} {'Side':>12} {'Entry':>6} {'Now':>6} "
               f"{'PnL':>8} {'SL':>5} {'TP':>5}")
         print(f"  {'-' * 70}")
         for p in positions:
-            print(f"  {p['id']:<16} {p['asset']:<6} {p['side']:>8} "
+            sl = f"{p['stop']:>5.2f}" if p['stop'] > 0 else "  n/a"
+            tp = f"{p['tp']:>5.2f}" if p['tp'] > 0 else "  n/a"
+            print(f"  {p['id']:<16} {p['asset']:<6} {p['side']:>12} "
                   f"${p['entry']:>4.2f} ${p['current']:>4.2f} "
-                  f"${p['pnl']:>+6.2f} {p['stop']:>5.2f} {p['tp']:>5.2f}")
+                  f"${p['pnl']:>+6.2f} {sl} {tp}")
 
     print()
     print(f"  Daily realized PnL: ${summary['daily_realized_pnl']:+.2f}")
@@ -173,11 +249,15 @@ def list_markets(client: PolymarketClient, assets: list[str]):
     print()
 
 
-def run_cycle(client: PolymarketClient, engine: ExecutionEngine,
+# ============================================================
+# Core cycle
+# ============================================================
+
+def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
               risk_mgr: RiskManager, assets: list[str],
               quiet: bool = False) -> int:
     """
-    Run one complete scan-and-trade cycle.
+    Run one complete scan-and-trade cycle across all active strategies.
 
     Returns the number of trades executed.
     """
@@ -196,14 +276,25 @@ def run_cycle(client: PolymarketClient, engine: ExecutionEngine,
         logger.warning("Kill switch active — skipping signal generation")
         return 0
 
-    # Step 3: Generate signals
-    signals = generate_signals(client, assets)
+    # Step 3: Collect signals from all strategies
+    all_signals = []
+    for strategy in strategies:
+        try:
+            logger.info(f"--- Running {strategy.name} ---")
+            signals = strategy.scan(assets)
+            all_signals.extend(signals)
+            logger.info(f"  {strategy.name}: {len(signals)} signals")
+        except Exception as e:
+            logger.error(f"Strategy {strategy.name} error: {e}", exc_info=True)
 
     if not quiet:
-        print_signals(signals)
+        print_signals(all_signals)
 
-    # Step 4: Execute signals (best first)
-    for sig in signals:
+    # Step 4: Execute signals (best first, across all strategies)
+    # Sort all signals by edge * confidence for unified prioritization
+    all_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
+
+    for sig in all_signals:
         # Portfolio-level risk check
         allowed, reason = risk_mgr.pre_trade_check(sig, engine.state)
         if not allowed:
@@ -222,8 +313,30 @@ def run_cycle(client: PolymarketClient, engine: ExecutionEngine,
     return trades_executed
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")
+    parser = argparse.ArgumentParser(
+        description="Polymarket Arbitrage Bot",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Strategies:
+  spot_divergence    Spot momentum vs Polymarket probability lag
+  high_prob_grinder  Buy >90%% events at scale, collect small edges
+  bilateral_arb      Buy both sides when YES+NO < $1.00
+  all                Run all strategies each cycle (default)
+
+Examples:
+  python -m polymarket --strategy bilateral_arb --loop
+  python -m polymarket --strategy high_prob_grinder --paper
+  python -m polymarket --strategy all --assets BTC --loop --interval 15
+        """,
+    )
+    parser.add_argument("--strategy", type=str, default="all",
+                        help="Strategy to run: spot_divergence, high_prob_grinder, "
+                             "bilateral_arb, all (default: all)")
     parser.add_argument("--loop", action="store_true",
                         help="Run continuously")
     parser.add_argument("--interval", type=int, default=None,
@@ -236,6 +349,8 @@ def main():
                         help="Show current positions and exit")
     parser.add_argument("--close-all", action="store_true",
                         help="Close all open positions and exit")
+    parser.add_argument("--strategies", action="store_true",
+                        help="List available strategies and exit")
     parser.add_argument("--paper", action="store_true",
                         help="Force paper trading mode")
     parser.add_argument("--live", action="store_true",
@@ -245,6 +360,11 @@ def main():
     parser.add_argument("--prices", action="store_true",
                         help="Show current spot prices and exit")
     args = parser.parse_args()
+
+    # List strategies
+    if args.strategies:
+        print_strategies()
+        return
 
     # Determine assets
     if args.assets:
@@ -265,19 +385,38 @@ def main():
 
     interval = args.interval or EXECUTION["poll_interval"]
 
+    # Resolve strategy selection
+    strategy_name = args.strategy.lower()
+    if strategy_name == "all":
+        strategy_names = list(STRATEGIES.keys())
+    else:
+        # Support comma-separated strategies
+        strategy_names = [s.strip() for s in strategy_name.split(",")]
+
+    # Instantiate strategies
+    active_strategies: list[BaseStrategy] = []
+    for name in strategy_names:
+        try:
+            strat = get_strategy(name, client)
+            active_strategies.append(strat)
+        except ValueError as e:
+            print(f"Error: {e}")
+            print_strategies()
+            return
+
     # Handle simple commands
     if args.prices:
-        print_banner()
+        print_banner(strategy_names)
         print_prices(assets)
         return
 
     if args.markets:
-        print_banner()
+        print_banner(strategy_names)
         list_markets(client, assets)
         return
 
     if args.status:
-        print_banner()
+        print_banner(strategy_names)
         print_positions(engine)
         print_risk_report(risk_mgr, engine)
         return
@@ -288,22 +427,23 @@ def main():
         return
 
     # Main execution
-    print_banner()
+    print_banner(strategy_names)
 
     if not args.quiet:
         print_prices(assets)
 
     if args.loop:
-        logger.info(f"Starting continuous loop (interval={interval}s)")
+        logger.info(f"Starting continuous loop (interval={interval}s, "
+                     f"strategies={','.join(strategy_names)})")
         cycle = 0
 
         while not _shutdown:
             cycle += 1
-            logger.info(f"--- Cycle {cycle} ---")
+            logger.info(f"=== Cycle {cycle} ===")
 
             try:
-                trades = run_cycle(client, engine, risk_mgr, assets,
-                                   quiet=args.quiet)
+                trades = run_cycle(active_strategies, engine, risk_mgr,
+                                   assets, quiet=args.quiet)
 
                 if not args.quiet:
                     print_positions(engine)
@@ -319,7 +459,6 @@ def main():
 
             if not _shutdown:
                 logger.info(f"Sleeping {interval}s...")
-                # Sleep in small increments so we can catch shutdown signals
                 for _ in range(interval):
                     if _shutdown:
                         break
@@ -331,8 +470,8 @@ def main():
 
     else:
         # Single cycle
-        trades = run_cycle(client, engine, risk_mgr, assets,
-                           quiet=args.quiet)
+        trades = run_cycle(active_strategies, engine, risk_mgr,
+                           assets, quiet=args.quiet)
 
         if not args.quiet:
             print_positions(engine)

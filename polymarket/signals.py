@@ -47,12 +47,12 @@ class MarketContext:
 
 @dataclass
 class Signal:
-    """An arbitrage signal."""
+    """An arbitrage signal produced by any strategy."""
     asset: str
     market: Market
     token_id: str
     side: str               # "BUY" or "SELL"
-    token_side: str         # "YES" or "NO"
+    token_side: str         # "YES", "NO", "YES+NO" (bilateral), "ALL_N_OUTCOMES"
 
     # Pricing
     spot_price: float
@@ -74,6 +74,21 @@ class Signal:
     # Metadata
     timestamp: float = 0.0
     reason: str = ""
+
+    # Strategy identification
+    strategy: str = "spot_divergence"
+
+    # For bilateral arb: details of each leg to execute
+    # List of dicts: [{"token_id": ..., "side": ..., "price": ..., "label": ...}]
+    arb_legs: list = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.arb_legs is None:
+            self.arb_legs = []
+
+    @property
+    def is_bilateral(self) -> bool:
+        return len(self.arb_legs) >= 2
 
 
 def extract_target_price(question: str) -> tuple[Optional[float], str]:
