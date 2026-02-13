@@ -1,0 +1,197 @@
+"""
+Polymarket Arbitrage Bot Configuration.
+
+Copy this to polymarket_config.py and fill in your credentials.
+"""
+
+# ============================================================
+# POLYMARKET API
+# ============================================================
+# CLOB API for order placement and market data.
+# Generate API credentials at https://polymarket.com
+# The bot uses the CLOB (Central Limit Order Book) API.
+
+POLYMARKET = {
+    # CLOB API endpoint
+    "clob_url": "https://clob.polymarket.com",
+    # Gamma API for market discovery
+    "gamma_url": "https://gamma-api.polymarket.com",
+    # API key (from Polymarket account)
+    "api_key": "",
+    # API secret
+    "api_secret": "",
+    # API passphrase
+    "api_passphrase": "",
+    # Polygon chain ID (137 = mainnet, 80001 = mumbai testnet)
+    "chain_id": 137,
+    # Wallet private key for signing (hex, without 0x prefix)
+    "private_key": "",
+    # USDC approval amount (in wei) — set high for fewer approvals
+    "funder": "",
+}
+
+# ============================================================
+# EXCHANGE DATA SOURCES
+# ============================================================
+# Spot price feeds. These use public endpoints (no auth needed).
+
+EXCHANGES = {
+    "binance": {
+        "enabled": True,
+        "base_url": "https://api.binance.com",
+        "weight": 0.50,  # Weighting in composite price
+    },
+    "coinbase": {
+        "enabled": True,
+        "base_url": "https://api.coinbase.com",
+        "weight": 0.30,
+    },
+    "kraken": {
+        "enabled": True,
+        "base_url": "https://api.kraken.com",
+        "weight": 0.20,
+    },
+}
+
+# ============================================================
+# TRACKED ASSETS
+# ============================================================
+# Map of assets to their exchange symbols and Polymarket search terms.
+
+ASSETS = {
+    "BTC": {
+        "binance": "BTCUSDT",
+        "coinbase": "BTC-USD",
+        "kraken": "XXBTZUSD",
+        "polymarket_tags": ["bitcoin", "btc"],
+    },
+    "ETH": {
+        "binance": "ETHUSDT",
+        "coinbase": "ETH-USD",
+        "kraken": "XETHZUSD",
+        "polymarket_tags": ["ethereum", "eth"],
+    },
+    "SOL": {
+        "binance": "SOLUSDT",
+        "coinbase": "SOL-USD",
+        "kraken": "SOLUSD",
+        "polymarket_tags": ["solana", "sol"],
+    },
+}
+
+# ============================================================
+# CHART TIMEFRAMES
+# ============================================================
+# Analysis windows in minutes. The bot builds candles at each
+# interval and computes momentum indicators.
+
+TIMEFRAMES = [5, 10, 15]  # minutes
+
+# ============================================================
+# STRATEGY PARAMETERS
+# ============================================================
+
+STRATEGY = {
+    # Minimum edge (probability points) to trigger a trade.
+    # E.g., 0.05 = 5 cents on a $1 contract.
+    "min_edge": 0.05,
+
+    # Momentum thresholds (rate of change over the timeframe).
+    # If spot momentum exceeds this and Polymarket hasn't caught up, signal fires.
+    "momentum_threshold_pct": 0.3,  # 0.3% move in the timeframe
+
+    # VWAP deviation threshold (% from VWAP).
+    # Strong moves away from VWAP increase conviction.
+    "vwap_deviation_pct": 0.2,
+
+    # RSI thresholds (14-period on the timeframe candles).
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+
+    # Minimum number of timeframes confirming the signal.
+    # If 2 out of 3 timeframes (5/10/15) agree, the signal is stronger.
+    "min_confirming_timeframes": 2,
+
+    # Stale market filter: skip if Polymarket spread > this.
+    "max_spread": 0.08,
+
+    # Confidence weighting: how much each indicator contributes.
+    "weights": {
+        "momentum": 0.35,
+        "vwap_dev": 0.25,
+        "rsi": 0.20,
+        "volume": 0.10,
+        "multi_tf": 0.10,
+    },
+}
+
+# ============================================================
+# RISK MANAGEMENT
+# ============================================================
+
+RISK = {
+    # Max position size per trade (in USDC)
+    "max_position_usdc": 100.0,
+
+    # Max total exposure across all open positions
+    "max_total_exposure_usdc": 500.0,
+
+    # Max number of concurrent open positions
+    "max_open_positions": 5,
+
+    # Stop loss: exit if contract moves against us by this much
+    "stop_loss": 0.10,  # 10 cents
+
+    # Take profit: exit if contract moves in our favor by this much
+    "take_profit": 0.15,  # 15 cents
+
+    # Max holding time (minutes). Close position after this regardless.
+    "max_hold_minutes": 60,
+
+    # Cooldown after a loss (seconds). Don't trade the same market.
+    "loss_cooldown_seconds": 300,
+
+    # Daily loss limit (USDC). Stop trading for the day if hit.
+    "daily_loss_limit_usdc": 200.0,
+}
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
+EXECUTION = {
+    # "paper" = log signals only, no real trades
+    # "live" = place real orders on Polymarket
+    "mode": "paper",
+
+    # Order type: "limit" or "market" (market = aggressive limit at best bid/ask)
+    "order_type": "limit",
+
+    # For limit orders: offset from fair value (in probability points).
+    # Positive = more conservative (less likely to fill, better price).
+    "limit_offset": 0.01,
+
+    # Poll interval (seconds) between each cycle
+    "poll_interval": 10,
+
+    # How often to refresh Polymarket market list (seconds)
+    "market_refresh_interval": 300,
+}
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
+
+NOTIFICATIONS = {
+    "webhook_url": "",
+    # Discord example: "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+}
+
+# ============================================================
+# DATA / STATE
+# ============================================================
+
+DATA = {
+    "state_file": "polymarket/state.json",
+    "trade_log": "polymarket/trades.jsonl",
+}
