@@ -33,74 +33,36 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
-from ..config import ASSETS
+from ..config import ASSETS, HIGH_PROB_GRINDER
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# Strategy-specific config (overridable from config.py)
-# ============================================================
-
-GRINDER_CONFIG = {
-    # Minimum YES price to consider (0.90 = 90c = 90% implied prob)
+# Default config — merged with config.py overrides at init
+_DEFAULTS = {
     "min_probability": 0.90,
-
-    # Maximum YES price (don't buy at 99c — too little upside)
     "max_probability": 0.97,
-
-    # Ideal sweet spot range for best risk/reward
     "sweet_spot_low": 0.91,
     "sweet_spot_high": 0.95,
-
-    # Minimum liquidity in USDC
     "min_liquidity": 5_000,
-
-    # Minimum total volume traded
     "min_volume": 10_000,
-
-    # Maximum bid-ask spread
     "max_spread": 0.04,
-
-    # Minimum depth: total size available at best ask (shares)
     "min_ask_depth": 50,
-
-    # Size per trade (USDC). Small and repeated.
     "size_per_trade_usdc": 20.0,
-
-    # Maximum concurrent positions from this strategy
     "max_positions": 50,
-
-    # Maximum total exposure for this strategy
     "max_exposure_usdc": 2_000.0,
-
-    # Don't buy markets expiring in less than N hours
-    # (last-minute volatility risk)
     "min_hours_to_expiry": 2,
-
-    # Don't buy markets expiring in more than N days
-    # (capital tied up too long)
     "max_days_to_expiry": 30,
-
-    # Categories to favor (these historically resolve as expected)
     "favored_keywords": [
         "will", "above", "below", "reach", "remain",
         "stay", "end", "close",
     ],
-
-    # Categories to avoid (unpredictable events)
     "avoid_keywords": [
         "tweet", "say", "announce", "resign", "fire",
         "scandal", "hack", "exploit",
     ],
-
-    # How many markets to scan per cycle (API rate limiting)
     "scan_limit": 200,
-
-    # Minimum edge: implied prob must overstate true prob by at least this.
-    # For a 93c contract, if we think true prob is 96%, edge = 0.03.
-    # We set a small minimum since the strategy relies on volume, not big edges.
     "min_edge": 0.01,
 }
 
@@ -146,7 +108,8 @@ class HighProbGrinder(BaseStrategy):
 
     def __init__(self, client: PolymarketClient):
         super().__init__(client)
-        self.cfg = GRINDER_CONFIG
+        # Merge: config.py overrides take precedence over defaults
+        self.cfg = {**_DEFAULTS, **HIGH_PROB_GRINDER}
         # Track what we've already bought this session to avoid duplicates
         self._seen_conditions: set[str] = set()
 

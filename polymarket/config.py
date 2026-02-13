@@ -133,11 +133,14 @@ RISK = {
     # Max position size per trade (in USDC)
     "max_position_usdc": 100.0,
 
-    # Max total exposure across all open positions
-    "max_total_exposure_usdc": 500.0,
+    # Max total exposure across all open positions.
+    # When running multiple strategies (grinder=2k, bilateral=2k, spot=500),
+    # set this high enough to accommodate them all.
+    "max_total_exposure_usdc": 5_000.0,
 
-    # Max number of concurrent open positions
-    "max_open_positions": 5,
+    # Max number of concurrent open positions.
+    # Grinder alone can hold 50, bilateral 20, so set to accommodate all.
+    "max_open_positions": 75,
 
     # Stop loss: exit if contract moves against us by this much
     "stop_loss": 0.10,  # 10 cents

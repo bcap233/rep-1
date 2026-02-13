@@ -309,6 +309,7 @@ class ExecutionEngine:
                      f"profit=${guaranteed_payout - total_cost:.2f}")
 
         order_ids = []
+        failed = False
 
         for i, leg in enumerate(legs):
             leg_label = leg.get("label", f"Leg {i}")
@@ -326,14 +327,22 @@ class ExecutionEngine:
                     size=size,
                 )
                 if not order:
-                    logger.error(f"  Leg {i+1} FAILED — arb incomplete!")
-                    # In production, you'd cancel all previous legs here.
-                    # For now, log the partial fill.
-                    order_ids.append(f"FAILED_leg{i}")
+                    logger.error(f"  Leg {i+1} FAILED — cancelling previous legs")
+                    # Cancel all previously placed legs to avoid naked exposure
+                    for prev_id in order_ids:
+                        if not prev_id.startswith("FAILED"):
+                            self.client.cancel_order(prev_id)
+                            logger.info(f"  Cancelled leg: {prev_id}")
+                    failed = True
+                    break
                 else:
                     order_ids.append(order.order_id)
             else:
                 order_ids.append(f"paper_leg{i}_{int(time.time())}")
+
+        if failed:
+            logger.error("Bilateral arb aborted — all legs cancelled")
+            return None
 
         # Track as a single combined position
         now = time.time()
@@ -393,6 +402,16 @@ class ExecutionEngine:
             else:
                 pos.unrealized_pnl = (pos.entry_price - current_price) * pos.entry_size
 
+            # Bilateral arb positions (stop=0, hold=0) are held to resolution —
+            # skip all stop/TP/time checks for them.
+            is_hold_to_resolution = (
+                pos.stop_loss_price == 0.0
+                and pos.take_profit_price == 0.0
+                and pos.max_hold_until == 0
+            )
+            if is_hold_to_resolution:
+                continue
+
             # Check stop loss
             if pos.side == "BUY" and current_price <= pos.stop_loss_price:
                 self._close_position(pos, current_price, "stop_loss")
@@ -416,7 +435,7 @@ class ExecutionEngine:
                 continue
 
             # Check max hold time
-            if time.time() >= pos.max_hold_until:
+            if pos.max_hold_until > 0 and time.time() >= pos.max_hold_until:
                 self._close_position(pos, current_price, "max_hold_time")
                 closed.append(pos)
                 continue

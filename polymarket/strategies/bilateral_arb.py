@@ -46,53 +46,26 @@ import time
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
-from ..config import ASSETS
+from ..config import ASSETS, BILATERAL_ARB
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# Strategy-specific config
-# ============================================================
-
-BILATERAL_CONFIG = {
-    # Minimum gap to trigger a trade (must exceed fees + slippage).
-    # In probability points: 0.03 = 3 cents.
-    "min_gap_intra": 0.02,      # Intra-market YES+NO arb
-    "min_gap_cross": 0.03,      # Cross-market arb (higher due to correlation risk)
-    "min_gap_multi": 0.04,      # Multi-outcome arb (higher due to execution complexity)
-
-    # Polymarket fee rate on winnings
+# Default config — merged with config.py overrides at init
+_DEFAULTS = {
+    "min_gap_intra": 0.02,
+    "min_gap_cross": 0.03,
+    "min_gap_multi": 0.04,
     "fee_rate": 0.02,
-
-    # Minimum liquidity for each side
     "min_liquidity_per_side": 2_000,
-
-    # Minimum depth at best ask for each side
     "min_depth_per_side": 20,
-
-    # Maximum spread on each individual side
     "max_spread_per_side": 0.05,
-
-    # Maximum number of concurrent arb positions
     "max_positions": 20,
-
-    # Size per leg (USDC). Both legs must be equal shares.
     "size_per_leg_usdc": 50.0,
-
-    # Maximum total exposure
     "max_exposure_usdc": 2_000.0,
-
-    # How many markets to scan
     "scan_limit": 200,
-
-    # For cross-market arb: maximum time gap between market
-    # expirations (hours). Markets must expire close together
-    # to be true complements.
     "max_expiry_gap_hours": 24,
-
-    # Keywords that indicate complementary markets
     "complement_keywords": {
         "above": "below",
         "over": "under",
@@ -123,7 +96,8 @@ class BilateralArb(BaseStrategy):
 
     def __init__(self, client: PolymarketClient):
         super().__init__(client)
-        self.cfg = BILATERAL_CONFIG
+        # Merge: config.py overrides take precedence over defaults
+        self.cfg = {**_DEFAULTS, **BILATERAL_ARB}
         self._market_cache: dict[str, Market] = {}
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
