@@ -3,6 +3,7 @@
 Polymarket Arbitrage Bot — Main Runner.
 
 Usage:
+    python -m polymarket --setup                            # First-time setup wizard
     python -m polymarket                                    # Run one scan (all strategies)
     python -m polymarket --loop                             # Run continuously
     python -m polymarket --strategy spot_divergence --loop  # Single strategy
@@ -322,6 +323,9 @@ def main():
         description="Polymarket Arbitrage Bot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+First-time setup:
+  python -m polymarket --setup
+
 Strategies:
   spot_divergence    Spot momentum vs Polymarket probability lag
   high_prob_grinder  Buy >90%% events at scale, collect small edges
@@ -329,8 +333,9 @@ Strategies:
   all                Run all strategies each cycle (default)
 
 Examples:
-  python -m polymarket --strategy bilateral_arb --loop
-  python -m polymarket --strategy high_prob_grinder --paper
+  python -m polymarket --setup                                   # Setup wizard
+  python -m polymarket --strategy bilateral_arb --loop           # Run bilateral arb
+  python -m polymarket --strategy high_prob_grinder --paper      # Paper trade grinder
   python -m polymarket --strategy all --assets BTC --loop --interval 15
         """,
     )
@@ -359,7 +364,15 @@ Examples:
                         help="Suppress dashboard output")
     parser.add_argument("--prices", action="store_true",
                         help="Show current spot prices and exit")
+    parser.add_argument("--setup", action="store_true",
+                        help="Run interactive setup wizard (wallet, API creds, funding)")
     args = parser.parse_args()
+
+    # Setup wizard
+    if args.setup:
+        from .setup import run_setup
+        run_setup()
+        return
 
     # List strategies
     if args.strategies:

@@ -1,33 +1,48 @@
 """
 Polymarket Arbitrage Bot Configuration.
 
-Copy this to polymarket_config.py and fill in your credentials.
+Credentials are loaded from environment variables or a .env file.
+Run `python -m polymarket --setup` to generate credentials.
 """
+
+import os
+
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
 
 # ============================================================
 # POLYMARKET API
 # ============================================================
 # CLOB API for order placement and market data.
-# Generate API credentials at https://polymarket.com
+# Credentials come from .env file (created by --setup).
 # The bot uses the CLOB (Central Limit Order Book) API.
 
 POLYMARKET = {
     # CLOB API endpoint
-    "clob_url": "https://clob.polymarket.com",
+    "clob_url": _env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
     # Gamma API for market discovery
-    "gamma_url": "https://gamma-api.polymarket.com",
-    # API key (from Polymarket account)
-    "api_key": "",
+    "gamma_url": _env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com"),
+    # API key (derived from wallet by --setup)
+    "api_key": _env("POLYMARKET_API_KEY"),
     # API secret
-    "api_secret": "",
+    "api_secret": _env("POLYMARKET_API_SECRET"),
     # API passphrase
-    "api_passphrase": "",
+    "api_passphrase": _env("POLYMARKET_API_PASSPHRASE"),
     # Polygon chain ID (137 = mainnet, 80001 = mumbai testnet)
-    "chain_id": 137,
+    "chain_id": int(_env("POLYMARKET_CHAIN_ID", "137")),
     # Wallet private key for signing (hex, without 0x prefix)
-    "private_key": "",
-    # USDC approval amount (in wei) — set high for fewer approvals
-    "funder": "",
+    "private_key": _env("POLYMARKET_PRIVATE_KEY"),
+    # Funder address (if using a separate funding wallet)
+    "funder": _env("POLYMARKET_FUNDER"),
 }
 
 # ============================================================
