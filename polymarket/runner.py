@@ -364,6 +364,8 @@ Examples:
                         help="Suppress dashboard output")
     parser.add_argument("--prices", action="store_true",
                         help="Show current spot prices and exit")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Run with live terminal dashboard")
     parser.add_argument("--setup", action="store_true",
                         help="Run interactive setup wizard (wallet, API creds, funding)")
     args = parser.parse_args()
@@ -440,6 +442,12 @@ Examples:
         return
 
     # Main execution
+    if args.dashboard:
+        from .dashboard import run_dashboard_with_bot
+        run_dashboard_with_bot(run_cycle, active_strategies, engine, risk_mgr,
+                               assets, interval)
+        return
+
     print_banner(strategy_names)
 
     if not args.quiet:
