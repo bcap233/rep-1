@@ -374,7 +374,7 @@ BILATERAL_ARB = {
 
 MARKET_MAKER = {
     # Which durations to make markets on
-    "durations": ["5m", "15m", "4h"],  # Include 5m for more opportunities
+    "durations": ["5m", "15m"],  # 4h books too thin (10c slippage kills edge)
     # Spread we want to capture (half-spread on each side)
     "half_spread": 0.02,         # 2c on each side = 4c total spread
     # Min spread in the book before we quote

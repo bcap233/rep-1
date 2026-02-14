@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 # Instead of guessing slippage, we fetch the actual CLOB order book
 # and simulate filling the order through real price levels.
+#
+# Two execution modes:
+#   MAKER: post a limit at our price, assume fill if price is within
+#          the top 3 levels of the opposing book.  Zero slippage.
+#   TAKER: walk through the book levels (market order).  Realistic slippage.
+#
+# MM strategy uses MAKER (that's how real MMs work — they post and wait).
+# All other strategies use TAKER.
 
 
 def _walk_book(levels: list[tuple[float, float]], size: int) -> tuple[float, int]:
@@ -68,6 +76,47 @@ def _walk_book(levels: list[tuple[float, float]], size: int) -> tuple[float, int
 def _cap_to_book_depth(levels: list[tuple[float, float]]) -> int:
     """Return total depth available across all book levels."""
     return int(sum(sz for _, sz in levels))
+
+
+def _estimate_round_trip_slippage(book: OrderBook, side: str, size: int) -> float:
+    """Estimate total round-trip slippage cost for a taker order.
+
+    Computes: (entry slippage) + (exit slippage) in price terms.
+    Entry = walking asks (for BUY); Exit = walking bids (to sell back).
+    """
+    entry_levels = book.asks if side == "BUY" else book.bids
+    exit_levels = book.bids if side == "BUY" else book.asks
+
+    entry_fill, _ = _walk_book(entry_levels, size)
+    exit_fill, _ = _walk_book(exit_levels, size)
+
+    if entry_fill == 0 or exit_fill == 0:
+        return 1.0  # No book = infinite slippage, skip trade
+
+    best_entry = entry_levels[0][0] if entry_levels else entry_fill
+    best_exit = exit_levels[0][0] if exit_levels else exit_fill
+
+    entry_slip = abs(entry_fill - best_entry)
+    exit_slip = abs(exit_fill - best_exit)
+
+    return entry_slip + exit_slip
+
+
+def _maker_fill_probable(book: OrderBook, side: str, price: float) -> bool:
+    """Check if a passive limit order at `price` is likely to fill.
+
+    A maker BUY fills when someone market-sells into us.
+    On short-duration Polymarket markets (5m/15m), price swings of
+    5-15c are normal within a single market window. So a bid that's
+    a few cents below the current best_bid will still get hit.
+
+    We allow bids up to 5c below best_bid (conservative — real swings
+    are often larger).
+    """
+    if side == "BUY":
+        return price >= (book.best_bid - 0.05) and book.spread <= 0.10
+    else:
+        return price <= (book.best_ask + 0.05) and book.spread <= 0.10
 
 
 @dataclass
@@ -126,17 +175,17 @@ class ExecutionState:
 def _calc_stop(signal, price: float) -> float:
     """Calculate stop loss price by strategy.
 
-    MM: 8c (2x spread, symmetric with TP)
-    Spot divergence: 12c (directional but short timeframe)
+    MM: 8c stop — 5-min markets swing 5-10c within a window, so 5c
+        was getting stopped out then reversing. 8c survives the noise.
+        With 15c TP this is still ~2:1 reward/risk.
+    Spot divergence: 10c
     Other: config default (18c)
     """
     strategy = getattr(signal, "strategy", "")
     if strategy == "market_maker":
         sl_dist = 0.08
     elif strategy == "spot_divergence":
-        # Tighter than default 18c — these are short-timeframe momentum
-        # trades. 12c gives ~3:1 reward/risk with 20c TP.
-        sl_dist = 0.12
+        sl_dist = 0.10
     else:
         sl_dist = RISK["stop_loss"]
 
@@ -150,13 +199,15 @@ def _calc_stop(signal, price: float) -> float:
 
 
 def _calc_tp(signal, price: float) -> float:
-    """Calculate take profit price. MM uses tighter, symmetric TPs."""
+    """Calculate take profit price.
+
+    MM: 15c TP with 5c SL = 3:1 reward/risk.
+    With maker fills (no slippage), we keep the full TP.
+    Need only 25% win rate to break even.
+    """
     is_mm = getattr(signal, "strategy", "") == "market_maker"
     if is_mm:
-        # MM TP at 8c — symmetric with stop for clean 1:1 risk/reward.
-        # We win more often than we lose (spread capture + momentum bias),
-        # so 1:1 payout with >50% win rate = positive EV.
-        tp_dist = 0.08
+        tp_dist = 0.15
     else:
         tp_dist = RISK["take_profit"]
 
@@ -418,6 +469,8 @@ class ExecutionEngine:
         mode = EXECUTION["mode"]
         price = signal.suggested_price
         size = signal.suggested_size
+        strategy = getattr(signal, "strategy", "")
+        is_maker = strategy == "market_maker"
 
         # Apply limit offset for non-aggressive orders
         if EXECUTION["order_type"] == "limit":
@@ -427,15 +480,39 @@ class ExecutionEngine:
             else:
                 price = min(0.99, price + offset)
 
-        # --- Paper-mode: walk the real order book for realistic fills ---
+        # --- Paper-mode execution ---
         slip_info = ""
         if mode == "paper":
             book = self.client.get_order_book(signal.token_id)
-            if book:
+            if not book:
+                logger.warning(f"[PAPER] No book for {signal.token_id[:20]}... — skipping")
+                return None
+
+            if is_maker:
+                # MAKER mode: post a passive limit at our price.
+                # MM strategy already computes the right bid price.
+                # No slippage — we get filled AT our price or not at all.
+                if not _maker_fill_probable(book, signal.side, price):
+                    logger.info(f"[PAPER] Maker fill unlikely: spread={book.spread:.3f} "
+                                f"price={price:.2f} best_bid={book.best_bid:.2f} "
+                                f"best_ask={book.best_ask:.2f} "
+                                f"| {signal.market.question[:40]}")
+                    return None
+                # Size is limited by what's realistic for a single maker order
+                size = min(size, 500)
+                slip_info = f"MAKER, spread={book.spread:.3f}, no_slippage"
+            else:
+                # TAKER mode: walk the book for realistic fills
+                # But first: check if the round-trip slippage exceeds the edge
+                rt_slip = _estimate_round_trip_slippage(book, signal.side, size)
+                if rt_slip > signal.edge * 0.7:
+                    logger.info(f"[PAPER] SKIP: rt_slippage={rt_slip:.3f} > "
+                                f"70% of edge={signal.edge:.3f} "
+                                f"| {signal.market.question[:40]}")
+                    return None
+
                 levels = book.asks if signal.side == "BUY" else book.bids
                 total_depth = _cap_to_book_depth(levels)
-
-                # Can't buy more than the book has
                 size = min(size, max(1, total_depth))
 
                 avg_fill, filled = _walk_book(levels, size)
@@ -443,16 +520,13 @@ class ExecutionEngine:
                     slip = abs(avg_fill - price)
                     price = round(avg_fill, 4)
                     size = filled
-                    slip_info = (f"slippage={slip:.3f}, "
-                                 f"book_depth={total_depth}, "
-                                 f"levels={len(levels)}")
+                    slip_info = (f"TAKER, slippage={slip:.3f}, "
+                                 f"rt_slip={rt_slip:.3f}, "
+                                 f"book_depth={total_depth}")
                 else:
                     logger.warning(f"[PAPER] Book empty for {signal.token_side} "
                                    f"| {signal.market.question[:40]} — skipping")
                     return None
-            else:
-                logger.warning(f"[PAPER] No book for {signal.token_id[:20]}... — skipping")
-                return None
 
         cost = price * size
 
@@ -679,9 +753,9 @@ class ExecutionEngine:
             # Threshold = half the stop distance for each strategy.
             strategy = getattr(pos, "strategy", "")
             if strategy == "market_maker":
-                trail_threshold = 0.04   # 8c stop → trail at 4c
+                trail_threshold = 0.08   # 8c stop → trail at 8c profit
             elif strategy == "spot_divergence":
-                trail_threshold = 0.06   # 12c stop → trail at 6c
+                trail_threshold = 0.05   # 10c stop → trail at 5c
             else:
                 trail_threshold = 0.08   # 18c stop → trail at 8c
 
@@ -750,19 +824,19 @@ class ExecutionEngine:
 
         mode = EXECUTION["mode"]
 
-        # Paper mode: walk real book for exit fill price
-        if mode == "paper":
+        # Paper mode: simulate exit fill
+        is_maker_exit = pos.strategy == "market_maker"
+        if mode == "paper" and not is_maker_exit:
+            # Taker exit: walk the book (realistic slippage)
             book = self.client.get_order_book(pos.token_id)
             if book:
-                # Selling = hitting bids; buying back = hitting asks
-                if pos.side == "BUY":
-                    levels = book.bids
-                else:
-                    levels = book.asks
+                levels = book.bids if pos.side == "BUY" else book.asks
                 if levels:
                     avg_fill, filled = _walk_book(levels, int(pos.entry_size))
                     if filled > 0:
                         exit_price = round(avg_fill, 4)
+        # MM exits as maker: post a limit on the other side at exit_price.
+        # No slippage — the exit_price (from midpoint) is our limit.
 
         if pos.side == "BUY":
             pos.realized_pnl = (exit_price - pos.entry_price) * pos.entry_size
