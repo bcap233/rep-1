@@ -96,6 +96,30 @@ def is_updown_market(question: str) -> bool:
     return "up or down" in question.lower()
 
 
+def _multi_tf_confidence(
+    consensus_score: float, analyses: list, confirming: int,
+) -> float:
+    """Compute confidence using data from ALL timeframes, not just the first."""
+    weights = STRATEGY["weights"]
+
+    # Average VWAP deviation across all timeframes
+    avg_vwap_dev = sum(abs(a.vwap_deviation) for a in analyses) / len(analyses)
+    # RSI: count how many TFs have extreme RSI
+    extreme_rsi_ratio = sum(
+        1 for a in analyses if a.rsi > 60 or a.rsi < 40
+    ) / len(analyses)
+    # Volume: average across TFs
+    avg_vol_ratio = sum(a.volume_ratio for a in analyses) / len(analyses)
+
+    return min(1.0, (
+        abs(consensus_score) * weights["momentum"]
+        + min(1, avg_vwap_dev / 0.5) * weights["vwap_dev"]
+        + extreme_rsi_ratio * weights["rsi"]
+        + min(1, avg_vol_ratio / 2) * weights["volume"]
+        + (confirming / len(analyses)) * weights["multi_tf"]
+    ))
+
+
 def extract_target_price(question: str) -> tuple[Optional[float], str]:
     """
     Extract the price target and direction from a Polymarket question.
@@ -414,7 +438,7 @@ def generate_signals(
                     no_book = client.get_order_book(token_id)
                     if not no_book:
                         continue
-                    suggested_price = min(no_book.best_ask, (1 - fair_prob) + edge * 0.5)
+                    suggested_price = min(no_book.best_ask, (1 - fair_prob) - edge * 0.5)
             else:  # direction == "below"
                 if consensus_dir == "bearish":
                     edge = fair_prob - implied_prob
@@ -432,20 +456,14 @@ def generate_signals(
                     no_book = client.get_order_book(token_id)
                     if not no_book:
                         continue
-                    suggested_price = min(no_book.best_ask, (1 - fair_prob) + edge * 0.5)
+                    suggested_price = min(no_book.best_ask, (1 - fair_prob) - edge * 0.5)
 
             # Only signal if edge exceeds minimum
             if edge < STRATEGY["min_edge"]:
                 continue
 
-            # Confidence score
-            confidence = min(1.0, (
-                abs(consensus_score) * STRATEGY["weights"]["momentum"] +
-                min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"] +
-                (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"] +
-                min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"] +
-                (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
-            ))
+            # Confidence score (multi-timeframe)
+            confidence = _multi_tf_confidence(consensus_score, analyses, confirming)
 
             # Suggested size based on edge and confidence
             from .config import RISK
@@ -541,13 +559,7 @@ def _evaluate_updown_signal(
 
     suggested_price = min(book.best_ask, implied_prob + edge * 0.5)
 
-    confidence = min(1.0, (
-        abs(consensus_score) * STRATEGY["weights"]["momentum"] +
-        min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"] +
-        (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"] +
-        min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"] +
-        (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
-    ))
+    confidence = _multi_tf_confidence(consensus_score, analyses, confirming)
 
     from .config import RISK
     max_size = RISK["max_position_usdc"]

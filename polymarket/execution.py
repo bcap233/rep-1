@@ -13,7 +13,9 @@ Supports paper trading (log only) and live execution.
 
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -98,8 +100,12 @@ def _calc_stop(signal, price: float) -> float:
         sl_dist = RISK["stop_loss"]
 
     if signal.side == "BUY":
-        return max(0.01, price - sl_dist)
-    return min(0.99, price + sl_dist)
+        sl = max(0.01, price - sl_dist)
+        # Prevent stop == entry (would never trigger or trigger immediately)
+        return min(sl, price - 0.01) if price > 0.02 else 0.01
+    else:
+        sl = min(0.99, price + sl_dist)
+        return max(sl, price + 0.01) if price < 0.98 else 0.99
 
 
 def _calc_tp(signal, price: float) -> float:
@@ -116,6 +122,18 @@ def _calc_tp(signal, price: float) -> float:
     if signal.side == "BUY":
         return min(0.99, price + tp_dist)
     return max(0.01, price - tp_dist)
+
+
+def _et_to_utc_offset_hours() -> int:
+    """Return the current ET→UTC offset: 5 (EST, Nov-Mar) or 4 (EDT, Mar-Nov)."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as dt
+        et_now = dt.now(ZoneInfo("America/New_York"))
+        return -et_now.utcoffset().total_seconds() // 3600
+    except Exception:
+        # Fallback: assume EST (correct Nov-Mar)
+        return 5
 
 
 def _market_end_timestamp(question: str) -> Optional[float]:
@@ -145,8 +163,8 @@ def _market_end_timestamp(question: str) -> Optional[float]:
             f"{date_str} {now.year} {h:02d}:{mi:02d}",
             "%B %d %Y %H:%M",
         ).replace(tzinfo=timezone.utc)
-        # Adjust for ET → UTC (+5 hours)
-        end_dt = end_dt + timedelta(hours=5)
+        # Adjust for ET → UTC (handles DST automatically)
+        end_dt = end_dt + timedelta(hours=_et_to_utc_offset_hours())
     except ValueError:
         return None
 
@@ -170,6 +188,7 @@ class ExecutionEngine:
         self.state = ExecutionState()
         self.bankroll = bankroll_mgr  # Optional BankrollManager for Kelly reinvestment
         self._position_counter = 0
+        self._mm_strategy = None  # Set by runner to wire up inventory tracking
         self._load_state()
 
     def _next_position_id(self) -> str:
@@ -198,19 +217,38 @@ class ExecutionEngine:
                 logger.warning(f"Could not load state: {e}")
 
     def _save_state(self):
-        """Persist state to disk."""
+        """Persist state to disk atomically (write to temp, then rename)."""
         path = Path(DATA["state_file"])
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Garbage-collect expired cooldowns
+        now = time.time()
+        self.state.cooldowns = {
+            k: v for k, v in self.state.cooldowns.items() if v > now
+        }
 
         data = {
             "positions": [vars(p) for p in self.state.positions],
             "daily_pnl": self.state.daily_pnl,
             "daily_trades": self.state.daily_trades,
             "cooldowns": self.state.cooldowns,
-            "last_update": time.time(),
+            "last_update": now,
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        # Atomic write: temp file + rename prevents corruption on crash
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _log_trade(self, position: Position, action: str):
         """Append trade to the trade log (JSONL)."""
@@ -396,6 +434,16 @@ class ExecutionEngine:
 
         self.state.positions.append(position)
         self.state.daily_trades += 1
+
+        # Update MM inventory tracking on open
+        if position.strategy == "market_maker" and self._mm_strategy is not None:
+            try:
+                self._mm_strategy.update_inventory(
+                    position.condition_id, position.token_side, position.entry_size
+                )
+            except Exception:
+                pass
+
         self._log_trade(position, "OPEN")
         self._save_state()
 
@@ -496,7 +544,7 @@ class ExecutionEngine:
         """
         closed = []
 
-        for pos in self.state.positions:
+        for pos in list(self.state.positions):
             if pos.status != "open":
                 continue
 
@@ -557,6 +605,7 @@ class ExecutionEngine:
             elif pos.side == "SELL":
                 profit = pos.entry_price - current_price
                 if profit >= trail_threshold:
+                    # For shorts, tighten stop DOWN toward entry (lower = tighter)
                     new_sl = pos.entry_price - 0.01
                     if new_sl < pos.stop_loss_price:
                         pos.stop_loss_price = new_sl
@@ -606,6 +655,10 @@ class ExecutionEngine:
 
     def _close_position(self, pos: Position, exit_price: float, reason: str):
         """Close a position (internal)."""
+        # Idempotency guard: prevent double-counting PnL if called twice
+        if pos.status == "closed":
+            return
+
         mode = EXECUTION["mode"]
 
         if pos.side == "BUY":
@@ -616,7 +669,29 @@ class ExecutionEngine:
         pos.exit_price = exit_price
         pos.exit_time = time.time()
         pos.exit_reason = reason
+
+        # Place exit order on live BEFORE marking closed — if order fails,
+        # position stays "open" so we can retry next cycle
+        if mode == "live":
+            exit_side = "SELL" if pos.side == "BUY" else "BUY"
+            order = self.client.place_order(
+                token_id=pos.token_id,
+                side=exit_side,
+                price=exit_price,
+                size=pos.entry_size,
+            )
+            if order:
+                pos.exit_order_id = order.order_id
+            else:
+                logger.error(f"Exit order FAILED for {pos.position_id} — "
+                             f"will retry next cycle")
+                pos.exit_price = 0.0
+                pos.exit_time = 0.0
+                pos.exit_reason = ""
+                return
+
         pos.status = "closed"
+        pos.unrealized_pnl = 0.0
 
         self.state.daily_pnl += pos.realized_pnl
 
@@ -628,26 +703,24 @@ class ExecutionEngine:
                      f"{pos.position_id} | reason={reason} | "
                      f"PnL=${pos.realized_pnl:+.2f}")
 
-        # Place exit order on live
-        if mode == "live":
-            exit_side = "SELL" if pos.side == "BUY" else "BUY"
-            order = self.client.place_order(
-                token_id=pos.token_id,
-                side=exit_side,
-                price=exit_price,
-                size=pos.entry_size,
-            )
-            if order:
-                pos.exit_order_id = order.order_id
-
         # Apply cooldown on losses
         if pos.realized_pnl < 0:
             self.state.cooldowns[pos.condition_id] = (
                 time.time() + RISK["loss_cooldown_seconds"]
             )
 
+        # Update MM inventory tracking (negative shares = sold/closed)
+        if pos.strategy == "market_maker" and self._mm_strategy is not None:
+            try:
+                self._mm_strategy.update_inventory(
+                    pos.condition_id, pos.token_side, -pos.entry_size
+                )
+            except Exception:
+                pass  # Don't let inventory tracking break closes
+
         # Move to closed list
-        self.state.positions.remove(pos)
+        if pos in self.state.positions:
+            self.state.positions.remove(pos)
         self.state.closed_positions.append(pos)
         self._log_trade(pos, "CLOSE")
 
@@ -665,7 +738,7 @@ class ExecutionEngine:
 
     def close_all(self, reason: str = "manual_close_all"):
         """Close all open positions."""
-        to_close = [p for p in self.state.positions if p.status == "open"]
+        to_close = list(self.state.positions)
         for pos in to_close:
             current_price = self.client.get_midpoint(pos.token_id)
             if current_price is None:

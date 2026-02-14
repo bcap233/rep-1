@@ -26,7 +26,7 @@ from ..exchanges import get_composite_price, get_best_candles
 from ..polymarket_client import PolymarketClient, Market
 from ..signals import (
     Signal, extract_target_price, estimate_fair_probability,
-    is_updown_market, estimate_updown_fair_probability,
+    estimate_updown_fair_probability, _multi_tf_confidence,
 )
 
 logger = logging.getLogger(__name__)
@@ -185,7 +185,7 @@ class SpotDivergence(BaseStrategy):
                         if not no_book:
                             continue
                         price = min(no_book.best_ask,
-                                    (1 - fair_prob) + edge * 0.5)
+                                    (1 - fair_prob) - edge * 0.5)
                 else:
                     if consensus_dir == "bearish":
                         edge = fair_prob - implied_prob
@@ -205,19 +205,13 @@ class SpotDivergence(BaseStrategy):
                         if not no_book:
                             continue
                         price = min(no_book.best_ask,
-                                    (1 - fair_prob) + edge * 0.5)
+                                    (1 - fair_prob) - edge * 0.5)
 
                 if edge < STRATEGY["min_edge"]:
                     continue
 
-                # Confidence
-                confidence = min(1.0, (
-                    abs(consensus_score) * STRATEGY["weights"]["momentum"]
-                    + min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"]
-                    + (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"]
-                    + min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"]
-                    + (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
-                ))
+                # Confidence (multi-timeframe)
+                confidence = _multi_tf_confidence(consensus_score, analyses, confirming)
 
                 # Sizing
                 max_size = RISK["max_position_usdc"]
@@ -314,14 +308,8 @@ class SpotDivergence(BaseStrategy):
 
         price = min(book.best_ask, implied_prob + edge * 0.5)
 
-        # Confidence
-        confidence = min(1.0, (
-            abs(consensus_score) * STRATEGY["weights"]["momentum"]
-            + min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"]
-            + (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"]
-            + min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"]
-            + (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
-        ))
+        # Confidence (multi-timeframe)
+        confidence = _multi_tf_confidence(consensus_score, analyses, confirming)
 
         max_size = RISK["max_position_usdc"]
         suggested_size = max_size * confidence * min(1.0, edge / 0.10)

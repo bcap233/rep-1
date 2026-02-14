@@ -100,7 +100,6 @@ class BilateralArb(BaseStrategy):
         super().__init__(client)
         # Merge: config.py overrides take precedence over defaults
         self.cfg = {**_DEFAULTS, **BILATERAL_ARB}
-        self._market_cache: dict[str, Market] = {}
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
         """
@@ -149,7 +148,6 @@ class BilateralArb(BaseStrategy):
             if m.condition_id not in seen:
                 seen.add(m.condition_id)
                 unique.append(m)
-                self._market_cache[m.condition_id] = m
 
         logger.info(f"[BILATERAL] Fetched {len(unique)} unique markets")
         return unique

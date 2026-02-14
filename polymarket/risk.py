@@ -15,6 +15,8 @@ Responsibilities:
 
 import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,8 +100,20 @@ class BankrollManager:
             "trade_history": [round(p, 2) for p in self.trade_history[-KELLY["rolling_window"]:]],
             "last_update": time.time(),
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        # Atomic write: temp file + rename prevents corruption on crash
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     # ---- Core Kelly math ----
 
@@ -172,7 +186,10 @@ class BankrollManager:
             # If Kelly says 0 (no edge), scale stays at 1.0
             # If Kelly says high edge, allow full bankroll scaling
             if fractional_kelly > 0:
-                scale = 1.0 + (base - 1.0) * min(1.0, fractional_kelly * 4)
+                # Use max(base, 1.0 + fractional_kelly) so scaling works
+                # even when bankroll hasn't grown yet (base ~= 1.0)
+                kelly_scale = 1.0 + fractional_kelly * 2  # Kelly-implied scale
+                scale = max(kelly_scale, 1.0 + (base - 1.0) * min(1.0, fractional_kelly * 4))
             else:
                 # Negative or zero edge: shrink back toward 1.0
                 scale = 1.0

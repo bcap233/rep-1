@@ -427,6 +427,12 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
                 boost *= side_boost[sig.token_side]
             if boost > 1.0:
                 adjusted_size = int(adjusted_size * boost)
+                # Re-check risk limits after boost to prevent exceeding caps
+                limits = risk_mgr.bankroll.get_effective_limits()
+                boosted_cost = adjusted_size * sig.suggested_price
+                max_pos = limits["max_position_usdc"]
+                if boosted_cost > max_pos:
+                    adjusted_size = max(1, int(max_pos / sig.suggested_price))
         sig.suggested_size = adjusted_size
 
         # Execute
@@ -558,6 +564,9 @@ Examples:
         try:
             strat = get_strategy(name, client)
             active_strategies.append(strat)
+            # Wire MM inventory tracking into execution engine
+            if name == "market_maker":
+                engine._mm_strategy = strat
         except ValueError as e:
             print(f"Error: {e}")
             print_strategies()

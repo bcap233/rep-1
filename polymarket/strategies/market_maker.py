@@ -102,15 +102,15 @@ def _minutes_to_market_end(question: str) -> Optional[float]:
         h = 0
 
     now = datetime.now(timezone.utc)
-    # ET is UTC-5
     try:
         end_dt = datetime.strptime(
             f"{date_str} {now.year} {h:02d}:{mi:02d}",
             "%B %d %Y %H:%M",
         ).replace(tzinfo=timezone.utc)
-        # Adjust for ET → UTC (+5 hours)
+        # Adjust for ET → UTC (handles DST: 5h EST Nov-Mar, 4h EDT Mar-Nov)
         from datetime import timedelta
-        end_dt = end_dt + timedelta(hours=5)
+        from ..execution import _et_to_utc_offset_hours
+        end_dt = end_dt + timedelta(hours=_et_to_utc_offset_hours())
     except ValueError:
         return None
 
