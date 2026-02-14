@@ -13,8 +13,10 @@ Supports paper trading (log only) and live execution.
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -106,6 +108,42 @@ def _calc_tp(signal, price: float) -> float:
     if signal.side == "BUY":
         return min(0.99, price + tp_dist)
     return max(0.01, price - tp_dist)
+
+
+def _market_end_timestamp(question: str) -> Optional[float]:
+    """Parse the market close time from the question text.
+
+    Returns Unix timestamp of the market end, or None if unparseable.
+    E.g. "Bitcoin Up or Down - February 14, 1:30PM-1:45PM ET" → timestamp for 1:45PM ET.
+    """
+    m = re.search(
+        r'(\w+ \d+),?\s*\d{1,2}:\d{2}(?:am|pm)\s*-\s*(\d{1,2}):(\d{2})(am|pm)\s*et',
+        question.lower(),
+    )
+    if not m:
+        return None
+
+    date_str = m.group(1)  # "february 14"
+    h, mi, p = int(m.group(2)), int(m.group(3)), m.group(4)
+
+    if p == 'pm' and h != 12:
+        h += 12
+    if p == 'am' and h == 12:
+        h = 0
+
+    now = datetime.now(timezone.utc)
+    try:
+        end_dt = datetime.strptime(
+            f"{date_str} {now.year} {h:02d}:{mi:02d}",
+            "%B %d %Y %H:%M",
+        ).replace(tzinfo=timezone.utc)
+        # Adjust for ET → UTC (+5 hours)
+        end_dt = end_dt + timedelta(hours=5)
+    except ValueError:
+        return None
+
+    ts = end_dt.timestamp()
+    return ts if ts > time.time() else None
 
 
 class ExecutionEngine:
@@ -344,7 +382,7 @@ class ExecutionEngine:
             current_price=price,
             stop_loss_price=_calc_stop(signal, price),
             take_profit_price=_calc_tp(signal, price),
-            max_hold_until=now + RISK["max_hold_minutes"] * 60,
+            max_hold_until=_market_end_timestamp(signal.market.question) or (now + RISK["max_hold_minutes"] * 60),
             strategy=getattr(signal, "strategy", ""),
         )
 
@@ -492,20 +530,21 @@ class ExecutionEngine:
             if is_hold_to_resolution:
                 continue
 
-            # Trailing stop for MM positions: once in profit by 4c+,
-            # move stop to entry (breakeven). Locks in gains without
-            # cutting winners short.
+            # Trailing stop: once in profit, move stop to breakeven.
+            # MM (8c stop): trigger at 4c profit (half of stop distance)
+            # Other (18c stop): trigger at 8c profit
             is_mm = getattr(pos, "strategy", "") == "market_maker"
-            if is_mm and pos.side == "BUY":
+            trail_threshold = 0.04 if is_mm else 0.08
+
+            if pos.side == "BUY":
                 profit = current_price - pos.entry_price
-                if profit >= 0.04:
-                    # Trail stop to entry + 1c (breakeven + tiny buffer)
+                if profit >= trail_threshold:
                     new_sl = pos.entry_price + 0.01
                     if new_sl > pos.stop_loss_price:
                         pos.stop_loss_price = new_sl
-            elif is_mm and pos.side == "SELL":
+            elif pos.side == "SELL":
                 profit = pos.entry_price - current_price
-                if profit >= 0.04:
+                if profit >= trail_threshold:
                     new_sl = pos.entry_price - 0.01
                     if new_sl < pos.stop_loss_price:
                         pos.stop_loss_price = new_sl
