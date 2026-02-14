@@ -216,7 +216,7 @@ STRATEGY = {
 
 RISK = {
     # Max position size per trade (in USDC)
-    "max_position_usdc": 100.0,
+    "max_position_usdc": 250.0,
 
     # Max total exposure across all open positions.
     # When running multiple strategies (grinder=2k, bilateral=2k, spot=500),
@@ -228,16 +228,16 @@ RISK = {
     "max_open_positions": 75,
 
     # Stop loss: exit if contract moves against us by this much
-    "stop_loss": 0.10,  # 10 cents
+    "stop_loss": 0.18,  # 18 cents — wider to survive short-duration swings
 
     # Take profit: exit if contract moves in our favor by this much
-    "take_profit": 0.15,  # 15 cents
+    "take_profit": 0.20,  # 20 cents
 
     # Max holding time (minutes). Close position after this regardless.
-    "max_hold_minutes": 60,
+    "max_hold_minutes": 120,
 
     # Cooldown after a loss (seconds). Don't trade the same market.
-    "loss_cooldown_seconds": 300,
+    "loss_cooldown_seconds": 120,
 
     # Daily loss limit (USDC). Stop trading for the day if hit.
     "daily_loss_limit_usdc": 200.0,
@@ -336,16 +336,16 @@ BILATERAL_ARB = {
 
 MARKET_MAKER = {
     # Which durations to make markets on
-    "durations": ["15m", "4h"],  # Skip 5m — too fast, fills before we can hedge
+    "durations": ["5m", "15m", "4h"],  # Include 5m for more opportunities
     # Spread we want to capture (half-spread on each side)
     "half_spread": 0.02,         # 2c on each side = 4c total spread
     # Min spread in the book before we quote
     "min_book_spread": 0.01,
     # Size per side (USDC)
-    "size_per_side_usdc": 25.0,
+    "size_per_side_usdc": 100.0,
     # Max inventory imbalance before we stop quoting one side
     # (net shares long or short on Up vs Down)
-    "max_inventory_shares": 100,
+    "max_inventory_shares": 250,
     # Inventory skew: shift quotes to offload inventory
     # At max inventory, shift by this many cents away from the heavy side
     "inventory_skew_max": 0.03,
@@ -354,9 +354,9 @@ MARKET_MAKER = {
     # Only quote if we're at least this far from market expiry
     "min_minutes_to_expiry": 2,
     # Max exposure across all MM positions
-    "max_exposure_usdc": 500.0,
+    "max_exposure_usdc": 2_000.0,
     # Max concurrent MM positions (each market = 1 position tracking both sides)
-    "max_positions": 10,
+    "max_positions": 30,
 }
 
 # ============================================================
