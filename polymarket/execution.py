@@ -62,6 +62,9 @@ class Position:
     take_profit_price: float = 0.0
     max_hold_until: float = 0.0  # Unix timestamp
 
+    # Strategy that opened this position
+    strategy: str = ""
+
 
 @dataclass
 class ExecutionState:
@@ -149,6 +152,7 @@ class ExecutionEngine:
             "size": position.entry_size,
             "pnl": position.realized_pnl if action == "CLOSE" else 0,
             "reason": position.exit_reason if action == "CLOSE" else "",
+            "strategy": position.strategy,
         }
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -190,9 +194,16 @@ class ExecutionEngine:
             return False, f"Cooldown active ({remaining:.0f}s remaining)"
 
         # Don't double up on same market
+        # MM can hold both sides (Up + Down) of the same market, but not
+        # duplicate the same side
+        is_mm = getattr(signal, "strategy", "") == "market_maker"
         for pos in self.state.positions:
             if pos.condition_id == signal.market.condition_id and pos.status == "open":
-                return False, f"Already have position in this market"
+                if is_mm:
+                    if pos.token_side == signal.token_side:
+                        return False, f"MM: already have {signal.token_side} in this market"
+                else:
+                    return False, f"Already have position in this market"
 
         return True, "OK"
 
@@ -278,6 +289,7 @@ class ExecutionEngine:
             stop_loss_price=max(0.01, price - RISK["stop_loss"]) if signal.side == "BUY" else min(0.99, price + RISK["stop_loss"]),
             take_profit_price=min(0.99, price + RISK["take_profit"]) if signal.side == "BUY" else max(0.01, price - RISK["take_profit"]),
             max_hold_until=now + RISK["max_hold_minutes"] * 60,
+            strategy=getattr(signal, "strategy", ""),
         )
 
         self.state.positions.append(position)
@@ -364,6 +376,7 @@ class ExecutionEngine:
             stop_loss_price=0.0,
             take_profit_price=0.0,
             max_hold_until=0,  # Hold until market resolves
+            strategy=getattr(signal, "strategy", ""),
         )
 
         self.state.positions.append(position)

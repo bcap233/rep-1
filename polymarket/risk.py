@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .config import RISK, STRATEGY
+from .config import RISK, STRATEGY, MARKET_MAKER
 from .execution import Position, ExecutionState
 from .signals import Signal
 
@@ -124,25 +124,41 @@ class RiskManager:
             return False, f"Kill switch active: {self._kill_switch_reason}"
 
         # Check correlation: don't stack too many positions on the same asset
+        # Market maker gets its own higher limit — it's hedged (both sides)
         open_positions = [p for p in state.positions if p.status == "open"]
         same_asset = [p for p in open_positions if p.asset == signal.asset]
-        if len(same_asset) >= 2:
-            return False, f"Too many positions on {signal.asset} ({len(same_asset)})"
+        is_mm = getattr(signal, "strategy", "") == "market_maker"
+        max_per_asset = MARKET_MAKER["max_positions"] if is_mm else 2
+        if len(same_asset) >= max_per_asset:
+            return False, f"Too many positions on {signal.asset} ({len(same_asset)}/{max_per_asset})"
 
-        # Check if we're in a losing streak
-        recent_closed = state.closed_positions[-5:] if state.closed_positions else []
-        if len(recent_closed) >= 3:
-            recent_losses = sum(1 for p in recent_closed if p.realized_pnl < 0)
-            if recent_losses >= 3:
-                return False, "Losing streak (3+ consecutive losses)"
+        # MM-specific exposure cap
+        if is_mm:
+            mm_exposure = sum(
+                p.entry_cost for p in open_positions
+                if getattr(p, "strategy", "") == "market_maker"
+            )
+            if mm_exposure >= MARKET_MAKER["max_exposure_usdc"]:
+                return False, f"MM exposure cap reached (${mm_exposure:.0f}/${MARKET_MAKER['max_exposure_usdc']:.0f})"
+
+        # Check if we're in a losing streak (skip for MM — spread trades
+        # have different loss characteristics than directional bets)
+        if not is_mm:
+            recent_closed = state.closed_positions[-5:] if state.closed_positions else []
+            if len(recent_closed) >= 3:
+                recent_losses = sum(1 for p in recent_closed if p.realized_pnl < 0)
+                if recent_losses >= 3:
+                    return False, "Losing streak (3+ consecutive losses)"
 
         # Edge quality check: require higher edge when we're already exposed
-        current_exposure = sum(p.entry_cost for p in open_positions)
-        exposure_ratio = current_exposure / RISK["max_total_exposure_usdc"]
+        # MM uses its own exposure cap above, so skip this check for MM
+        if not is_mm:
+            current_exposure = sum(p.entry_cost for p in open_positions)
+            exposure_ratio = current_exposure / RISK["max_total_exposure_usdc"]
 
-        if exposure_ratio > 0.5 and signal.edge < STRATEGY["min_edge"] * 1.5:
-            return False, (f"Edge too low for current exposure "
-                           f"({signal.edge:.3f} < {STRATEGY['min_edge'] * 1.5:.3f})")
+            if exposure_ratio > 0.5 and signal.edge < STRATEGY["min_edge"] * 1.5:
+                return False, (f"Edge too low for current exposure "
+                               f"({signal.edge:.3f} < {STRATEGY['min_edge'] * 1.5:.3f})")
 
         return True, "OK"
 
