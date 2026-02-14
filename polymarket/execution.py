@@ -28,6 +28,60 @@ from .signals import Signal
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------
+# Paper-mode slippage simulation
+# --------------------------------------------------------
+# Real Polymarket CLOB books are thin, especially on short-duration
+# BTC Up/Down markets.  Paper mode previously assumed instant fills
+# at best-ask, which overstated returns by ~$5-10k per 400 trades.
+# This model adds realistic slippage based on order size and price tier.
+
+# Maximum shares per order for penny-priced contracts.
+# Real books have 50-200 shares at 1-2c; buying 10,000 is impossible.
+_PAPER_MAX_SHARES_PENNY = 250      # contracts priced <= 5c
+_PAPER_MAX_SHARES_CHEAP = 500      # contracts priced 5-20c
+_PAPER_MAX_SHARES_DEFAULT = 1_000  # everything else
+
+
+def _estimate_paper_slippage(price: float, size: int) -> float:
+    """Return estimated slippage in probability points for a paper trade.
+
+    Model assumptions (conservative, based on typical BTC Up/Down books):
+      - Penny (<=5c):  10c base + 0.5c per 50 extra shares
+      - Cheap (5-20c): 3c base  + 0.3c per 100 extra shares
+      - Mid (20-80c):  1.5c base + 0.2c per 100 extra shares
+      - Expensive (>80c): 0.5c base + 0.1c per 100 extra shares
+    """
+    if price <= 0.05:
+        base = 0.04
+        per_unit = 0.005 / 50  # 0.5c per 50 shares
+        depth_at_best = 100
+    elif price <= 0.20:
+        base = 0.025
+        per_unit = 0.003 / 100
+        depth_at_best = 200
+    elif price <= 0.80:
+        base = 0.015
+        per_unit = 0.002 / 100
+        depth_at_best = 300
+    else:
+        base = 0.005
+        per_unit = 0.001 / 100
+        depth_at_best = 400
+
+    excess = max(0, size - depth_at_best)
+    slippage = base + excess * per_unit
+    return round(min(slippage, 0.20), 4)   # cap at 20c
+
+
+def _cap_paper_size(price: float, size: int) -> int:
+    """Cap order size for paper trades to match realistic book depth."""
+    if price <= 0.05:
+        return min(size, _PAPER_MAX_SHARES_PENNY)
+    if price <= 0.20:
+        return min(size, _PAPER_MAX_SHARES_CHEAP)
+    return min(size, _PAPER_MAX_SHARES_DEFAULT)
+
 
 @dataclass
 class Position:
@@ -386,6 +440,16 @@ class ExecutionEngine:
             else:
                 price = min(0.99, price + offset)
 
+        # --- Paper-mode slippage simulation ---
+        if mode == "paper":
+            size = _cap_paper_size(price, size)
+            slip = _estimate_paper_slippage(price, size)
+            if signal.side == "BUY":
+                price = min(0.99, price + slip)
+            else:
+                price = max(0.01, price - slip)
+            price = round(price, 4)
+
         cost = price * size
 
         logger.info(f"{'[PAPER] ' if mode == 'paper' else ''}Executing: "
@@ -408,7 +472,7 @@ class ExecutionEngine:
             logger.info(f"Order placed: {order_id}")
         else:
             order_id = f"paper_{int(time.time())}"
-            logger.info(f"Paper trade logged: {order_id}")
+            logger.info(f"Paper trade logged (slippage={slip:.3f}): {order_id}")
 
         # Create position
         now = time.time()
@@ -461,6 +525,11 @@ class ExecutionEngine:
         legs = signal.arb_legs
         size = signal.suggested_size
 
+        # Cap size for paper mode based on cheapest leg price
+        if mode == "paper":
+            min_leg_price = min(leg["price"] for leg in legs)
+            size = _cap_paper_size(min_leg_price, size)
+
         total_cost = sum(leg["price"] * size for leg in legs)
         guaranteed_payout = size  # One leg resolves to $1.00 * size
 
@@ -480,6 +549,12 @@ class ExecutionEngine:
 
             logger.info(f"  Leg {i+1}/{len(legs)}: BUY {size} {leg_label} "
                          f"@ ${leg_price:.2f}")
+
+            # Paper slippage per leg
+            if mode == "paper":
+                slip = _estimate_paper_slippage(leg_price, size)
+                leg_price = min(0.99, leg_price + slip)
+                leg_price = round(leg_price, 4)
 
             if mode == "live":
                 order = self.client.place_order(
@@ -660,6 +735,17 @@ class ExecutionEngine:
             return
 
         mode = EXECUTION["mode"]
+
+        # Apply exit slippage in paper mode (selling into the bid)
+        if mode == "paper":
+            slip = _estimate_paper_slippage(exit_price, int(pos.entry_size))
+            if pos.side == "BUY":
+                # Selling: slippage works against us (lower fill)
+                exit_price = max(0.005, exit_price - slip)
+            else:
+                # Buying back: slippage works against us (higher fill)
+                exit_price = min(0.995, exit_price + slip)
+            exit_price = round(exit_price, 4)
 
         if pos.side == "BUY":
             pos.realized_pnl = (exit_price - pos.entry_price) * pos.entry_size
