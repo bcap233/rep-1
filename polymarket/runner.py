@@ -28,6 +28,7 @@ Strategies:
 import argparse
 import json
 import logging
+import os
 import signal as sys_signal
 import sys
 import time
@@ -514,6 +515,26 @@ Examples:
         EXECUTION["mode"] = "paper"
     elif args.live:
         EXECUTION["mode"] = "live"
+
+    # Single-instance enforcement (only in loop mode).
+    # Read-only commands (--status, --prices, etc.) skip this.
+    if args.loop:
+        pid_file = Path("data/bot.pid")
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        if pid_file.exists():
+            try:
+                old_pid = int(pid_file.read_text().strip())
+                os.kill(old_pid, 9)
+                logger.info(f"Killed previous bot instance (PID {old_pid})")
+                time.sleep(1)
+            except (ProcessLookupError, ValueError):
+                pass  # Already dead
+            except PermissionError:
+                logger.warning(f"Cannot kill PID {old_pid} — may have duplicate instances")
+        pid_file.write_text(str(os.getpid()))
+
+        import atexit
+        atexit.register(lambda: pid_file.unlink(missing_ok=True))
 
     # Initialize components — shared bankroll manager for Kelly reinvestment
     client = PolymarketClient()
