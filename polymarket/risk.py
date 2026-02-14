@@ -272,20 +272,25 @@ class RiskManager:
         if remaining < daily_loss_limit * 0.25:
             warnings.append(f"Approaching daily loss limit: ${remaining:.2f} remaining")
 
-        # Drawdown warning
-        if drawdown > daily_loss_limit * 0.5:
-            warnings.append(f"Significant drawdown from peak: ${drawdown:.2f}")
+        # Drawdown warning — relative to bankroll, not daily loss limit
+        bankroll_val = self.bankroll.bankroll if self.bankroll else RISK["max_total_exposure_usdc"]
+        drawdown_pct = drawdown / bankroll_val if bankroll_val > 0 else 0
+        if drawdown_pct > 0.05:
+            warnings.append(f"Drawdown from peak: ${drawdown:.2f} ({drawdown_pct:.1%} of bankroll)")
 
-        # Kill switch conditions
+        # Kill switch: only on absolute daily loss, not drawdowns from profit peaks.
+        # A session that's up $1,000 and dips $150 should NOT be killed.
         if state.daily_pnl <= -daily_loss_limit:
             self.kill_switch = True
             self._kill_switch_reason = "Daily loss limit exceeded"
             warnings.append("KILL SWITCH ACTIVATED: Daily loss limit exceeded")
 
-        if drawdown > daily_loss_limit * 0.75:
+        # Kill switch on severe drawdown — only if daily PnL is negative
+        # (i.e., we're losing, not just giving back some of our gains)
+        if state.daily_pnl < 0 and drawdown > daily_loss_limit * 0.75:
             self.kill_switch = True
-            self._kill_switch_reason = "Severe drawdown from session peak"
-            warnings.append("KILL SWITCH ACTIVATED: Severe drawdown")
+            self._kill_switch_reason = "Severe drawdown while in loss"
+            warnings.append("KILL SWITCH ACTIVATED: Severe drawdown while in loss")
 
         return RiskReport(
             timestamp=time.time(),
