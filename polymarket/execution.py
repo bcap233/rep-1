@@ -81,11 +81,19 @@ class ExecutionState:
 
 
 def _calc_stop(signal, price: float) -> float:
-    """Calculate stop loss price. MM uses tighter, symmetric stops."""
-    is_mm = getattr(signal, "strategy", "") == "market_maker"
-    if is_mm:
-        # MM edge is spread-based (2-4c). Use 8c stop — 2x the spread.
+    """Calculate stop loss price by strategy.
+
+    MM: 8c (2x spread, symmetric with TP)
+    Spot divergence: 12c (directional but short timeframe)
+    Other: config default (18c)
+    """
+    strategy = getattr(signal, "strategy", "")
+    if strategy == "market_maker":
         sl_dist = 0.08
+    elif strategy == "spot_divergence":
+        # Tighter than default 18c — these are short-timeframe momentum
+        # trades. 12c gives ~3:1 reward/risk with 20c TP.
+        sl_dist = 0.12
     else:
         sl_dist = RISK["stop_loss"]
 
@@ -531,10 +539,14 @@ class ExecutionEngine:
                 continue
 
             # Trailing stop: once in profit, move stop to breakeven.
-            # MM (8c stop): trigger at 4c profit (half of stop distance)
-            # Other (18c stop): trigger at 8c profit
-            is_mm = getattr(pos, "strategy", "") == "market_maker"
-            trail_threshold = 0.04 if is_mm else 0.08
+            # Threshold = half the stop distance for each strategy.
+            strategy = getattr(pos, "strategy", "")
+            if strategy == "market_maker":
+                trail_threshold = 0.04   # 8c stop → trail at 4c
+            elif strategy == "spot_divergence":
+                trail_threshold = 0.06   # 12c stop → trail at 6c
+            else:
+                trail_threshold = 0.08   # 18c stop → trail at 8c
 
             if pos.side == "BUY":
                 profit = current_price - pos.entry_price

@@ -81,8 +81,8 @@ def _http_get(url: str, timeout: int = 10) -> Optional[dict | list]:
     except urllib.error.HTTPError as e:
         if e.code == 451:
             _blocked_domains[netloc] = time.time() + _CIRCUIT_BREAKER_DURATION
-            logger.warning(f"HTTP 451 from {netloc} — circuit breaker tripped for "
-                           f"{_CIRCUIT_BREAKER_DURATION}s")
+            logger.debug(f"HTTP 451 from {netloc} — circuit breaker tripped for "
+                         f"{_CIRCUIT_BREAKER_DURATION}s")
         else:
             logger.warning(f"HTTP {e.code} from {url}")
         return None
