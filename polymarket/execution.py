@@ -492,6 +492,24 @@ class ExecutionEngine:
             if is_hold_to_resolution:
                 continue
 
+            # Trailing stop for MM positions: once in profit by 4c+,
+            # move stop to entry (breakeven). Locks in gains without
+            # cutting winners short.
+            is_mm = getattr(pos, "strategy", "") == "market_maker"
+            if is_mm and pos.side == "BUY":
+                profit = current_price - pos.entry_price
+                if profit >= 0.04:
+                    # Trail stop to entry + 1c (breakeven + tiny buffer)
+                    new_sl = pos.entry_price + 0.01
+                    if new_sl > pos.stop_loss_price:
+                        pos.stop_loss_price = new_sl
+            elif is_mm and pos.side == "SELL":
+                profit = pos.entry_price - current_price
+                if profit >= 0.04:
+                    new_sl = pos.entry_price - 0.01
+                    if new_sl < pos.stop_loss_price:
+                        pos.stop_loss_price = new_sl
+
             # Check stop loss
             if pos.side == "BUY" and current_price <= pos.stop_loss_price:
                 self._close_position(pos, current_price, "stop_loss")
@@ -513,6 +531,16 @@ class ExecutionEngine:
                 self._close_position(pos, current_price, "take_profit")
                 closed.append(pos)
                 continue
+
+            # Near-expiry profit-taking: if close to max hold time and
+            # in profit, exit early to lock in gains instead of gambling
+            # on resolution. Within 2 minutes of expiry + in profit = exit.
+            if pos.max_hold_until > 0:
+                time_left = pos.max_hold_until - time.time()
+                if time_left <= 120 and pos.unrealized_pnl > 0:
+                    self._close_position(pos, current_price, "near_expiry_profit")
+                    closed.append(pos)
+                    continue
 
             # Check max hold time
             if pos.max_hold_until > 0 and time.time() >= pos.max_hold_until:
