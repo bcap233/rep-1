@@ -10,14 +10,17 @@ Responsibilities:
   - Volatility-adjusted sizing
   - Drawdown monitoring
   - Kill switch for anomalous conditions
+  - Kelly criterion bankroll management
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-from .config import RISK, STRATEGY, MARKET_MAKER
+from .config import RISK, STRATEGY, MARKET_MAKER, KELLY
 from .execution import Position, ExecutionState
 from .signals import Signal
 
@@ -41,6 +44,188 @@ class RiskReport:
     warnings: list[str]
 
 
+class BankrollManager:
+    """
+    Kelly-criterion bankroll management.
+
+    Tracks cumulative PnL across sessions and computes a dynamic scale
+    factor for position sizing. Uses half-Kelly by default for
+    sustainable compounding with controlled variance.
+
+    The scale factor multiplies base risk limits:
+      - max_total_exposure_usdc
+      - max_position_usdc
+      - daily_loss_limit_usdc
+      - MM max_exposure_usdc
+    """
+
+    def __init__(self):
+        self.initial_bankroll = KELLY["initial_bankroll_usdc"]
+        self.bankroll = self.initial_bankroll
+        self.peak_bankroll = self.initial_bankroll
+        self.cumulative_pnl = 0.0
+        self.trade_history: list[float] = []  # list of realized PnLs
+        self._load()
+
+    # ---- Persistence ----
+
+    def _load(self):
+        path = Path(KELLY["bankroll_file"])
+        if path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                self.bankroll = data.get("bankroll", self.initial_bankroll)
+                self.peak_bankroll = data.get("peak_bankroll", self.bankroll)
+                self.cumulative_pnl = data.get("cumulative_pnl", 0.0)
+                self.trade_history = data.get("trade_history", [])
+                # Keep only the rolling window
+                window = KELLY["rolling_window"]
+                self.trade_history = self.trade_history[-window:]
+                logger.info(f"[KELLY] Loaded bankroll: ${self.bankroll:.2f} "
+                            f"(peak ${self.peak_bankroll:.2f}, "
+                            f"{len(self.trade_history)} trades in window)")
+            except Exception as e:
+                logger.warning(f"[KELLY] Could not load bankroll: {e}")
+
+    def save(self):
+        path = Path(KELLY["bankroll_file"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "bankroll": round(self.bankroll, 2),
+            "peak_bankroll": round(self.peak_bankroll, 2),
+            "cumulative_pnl": round(self.cumulative_pnl, 2),
+            "trade_history": [round(p, 2) for p in self.trade_history[-KELLY["rolling_window"]:]],
+            "last_update": time.time(),
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    # ---- Core Kelly math ----
+
+    def record_trade(self, realized_pnl: float):
+        """Record a closed trade's PnL and update bankroll."""
+        self.trade_history.append(realized_pnl)
+        # Trim to rolling window
+        window = KELLY["rolling_window"]
+        if len(self.trade_history) > window:
+            self.trade_history = self.trade_history[-window:]
+
+        self.cumulative_pnl += realized_pnl
+        self.bankroll += realized_pnl
+
+        # Update peak
+        if self.bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.bankroll
+
+        self.save()
+
+    def kelly_fraction(self) -> float:
+        """
+        Compute Kelly fraction from rolling trade history.
+
+        Kelly f* = (p * avg_win - q * avg_loss) / avg_win
+        where p = win rate, q = 1-p
+
+        Returns 0.0 if not enough data or edge is negative.
+        """
+        if len(self.trade_history) < KELLY["min_trades_for_kelly"]:
+            return 0.0
+
+        wins = [p for p in self.trade_history if p > 0]
+        losses = [abs(p) for p in self.trade_history if p < 0]
+
+        if not wins or not losses:
+            return 0.0
+
+        win_rate = len(wins) / len(self.trade_history)
+        avg_win = sum(wins) / len(wins)
+        avg_loss = sum(losses) / len(losses)
+
+        if avg_win == 0:
+            return 0.0
+
+        # Kelly formula
+        f_star = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
+
+        # Clamp to [0, 1] — negative means don't bet at all
+        return max(0.0, min(1.0, f_star))
+
+    def scale_factor(self) -> float:
+        """
+        Compute the bankroll scale factor for position sizing.
+
+        Base scale = bankroll / initial_bankroll (simple ratio).
+        Modulated by Kelly: if Kelly says bet less, we scale down.
+        Clamped between min_scale and max_scale.
+        Subject to drawdown throttle.
+        """
+        # Base: how much has the bankroll grown?
+        base = self.bankroll / self.initial_bankroll
+
+        # Kelly modulation: blend base scale toward 1.0 based on Kelly
+        kelly_f = self.kelly_fraction()
+        fractional_kelly = kelly_f * KELLY["fraction"]
+
+        if len(self.trade_history) >= KELLY["min_trades_for_kelly"]:
+            # Scale = base adjusted by Kelly confidence
+            # If Kelly says 0 (no edge), scale stays at 1.0
+            # If Kelly says high edge, allow full bankroll scaling
+            if fractional_kelly > 0:
+                scale = 1.0 + (base - 1.0) * min(1.0, fractional_kelly * 4)
+            else:
+                # Negative or zero edge: shrink back toward 1.0
+                scale = 1.0
+        else:
+            # Not enough data yet — use conservative bankroll scaling
+            scale = 1.0 + (base - 1.0) * 0.3  # only 30% of growth
+
+        # Drawdown throttle
+        if self.peak_bankroll > 0:
+            drawdown_pct = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+            if drawdown_pct > KELLY["drawdown_throttle_pct"]:
+                # In drawdown — scale back toward 1.0
+                throttle = max(0.3, 1.0 - drawdown_pct * 3)
+                scale *= throttle
+                logger.info(f"[KELLY] Drawdown throttle active: "
+                            f"{drawdown_pct:.1%} DD → {throttle:.2f}x throttle")
+
+        # Clamp
+        scale = max(KELLY["min_scale"], min(KELLY["max_scale"], scale))
+        return scale
+
+    def get_effective_limits(self) -> dict:
+        """
+        Return scaled risk limits based on current bankroll.
+
+        These override the static config values.
+        """
+        s = self.scale_factor()
+        return {
+            "max_total_exposure_usdc": RISK["max_total_exposure_usdc"] * s,
+            "max_position_usdc": RISK["max_position_usdc"] * s,
+            "daily_loss_limit_usdc": RISK["daily_loss_limit_usdc"] * s,
+            "mm_max_exposure_usdc": MARKET_MAKER["max_exposure_usdc"] * s,
+        }
+
+    def summary(self) -> dict:
+        """Bankroll status for display."""
+        return {
+            "bankroll": round(self.bankroll, 2),
+            "initial": round(self.initial_bankroll, 2),
+            "cumulative_pnl": round(self.cumulative_pnl, 2),
+            "peak": round(self.peak_bankroll, 2),
+            "drawdown": round(self.peak_bankroll - self.bankroll, 2),
+            "kelly_fraction": round(self.kelly_fraction(), 4),
+            "half_kelly": round(self.kelly_fraction() * KELLY["fraction"], 4),
+            "scale_factor": round(self.scale_factor(), 3),
+            "trades_in_window": len(self.trade_history),
+            "win_rate": round(
+                len([p for p in self.trade_history if p > 0]) / len(self.trade_history), 3
+            ) if self.trade_history else 0.0,
+        }
+
+
 class RiskManager:
     """
     Portfolio-level risk management.
@@ -52,18 +237,21 @@ class RiskManager:
         rm.adjust_size(signal, execution_state) → adjusted_size
     """
 
-    def __init__(self):
+    def __init__(self, bankroll_mgr: Optional[BankrollManager] = None):
         self.session_peak_pnl = 0.0
         self.kill_switch = False
         self._kill_switch_reason = ""
+        self.bankroll = bankroll_mgr or BankrollManager()
 
     def assess(self, state: ExecutionState) -> RiskReport:
         """
         Generate a risk report for the current portfolio state.
+        Uses Kelly-scaled limits for all thresholds.
         """
+        limits = self.bankroll.get_effective_limits()
         open_positions = [p for p in state.positions if p.status == "open"]
         total_exposure = sum(p.entry_cost for p in open_positions)
-        max_exposure = RISK["max_total_exposure_usdc"]
+        max_exposure = limits["max_total_exposure_usdc"]
         utilization = (total_exposure / max_exposure * 100) if max_exposure > 0 else 0
 
         # Track session peak
@@ -71,6 +259,7 @@ class RiskManager:
             self.session_peak_pnl = state.daily_pnl
 
         drawdown = self.session_peak_pnl - state.daily_pnl
+        daily_loss_limit = limits["daily_loss_limit_usdc"]
 
         warnings = []
 
@@ -79,21 +268,21 @@ class RiskManager:
             warnings.append(f"High exposure utilization: {utilization:.0f}%")
 
         # Approaching daily loss limit
-        remaining = RISK["daily_loss_limit_usdc"] + state.daily_pnl  # daily_pnl is negative when losing
-        if remaining < RISK["daily_loss_limit_usdc"] * 0.25:
+        remaining = daily_loss_limit + state.daily_pnl  # daily_pnl is negative when losing
+        if remaining < daily_loss_limit * 0.25:
             warnings.append(f"Approaching daily loss limit: ${remaining:.2f} remaining")
 
         # Drawdown warning
-        if drawdown > RISK["daily_loss_limit_usdc"] * 0.5:
+        if drawdown > daily_loss_limit * 0.5:
             warnings.append(f"Significant drawdown from peak: ${drawdown:.2f}")
 
         # Kill switch conditions
-        if state.daily_pnl <= -RISK["daily_loss_limit_usdc"]:
+        if state.daily_pnl <= -daily_loss_limit:
             self.kill_switch = True
             self._kill_switch_reason = "Daily loss limit exceeded"
             warnings.append("KILL SWITCH ACTIVATED: Daily loss limit exceeded")
 
-        if drawdown > RISK["daily_loss_limit_usdc"] * 0.75:
+        if drawdown > daily_loss_limit * 0.75:
             self.kill_switch = True
             self._kill_switch_reason = "Severe drawdown from session peak"
             warnings.append("KILL SWITCH ACTIVATED: Severe drawdown")
@@ -106,7 +295,7 @@ class RiskManager:
             open_positions=len(open_positions),
             max_positions=RISK["max_open_positions"],
             daily_pnl=state.daily_pnl,
-            daily_loss_limit=RISK["daily_loss_limit_usdc"],
+            daily_loss_limit=daily_loss_limit,
             daily_pnl_pct=(state.daily_pnl / max_exposure * 100) if max_exposure > 0 else 0,
             drawdown_from_peak=drawdown,
             kill_switch_active=self.kill_switch,
@@ -117,11 +306,14 @@ class RiskManager:
                         state: ExecutionState) -> tuple[bool, str]:
         """
         Pre-trade risk validation beyond the basic execution checks.
+        Uses Kelly-scaled limits.
 
         Returns (allowed, reason).
         """
         if self.kill_switch:
             return False, f"Kill switch active: {self._kill_switch_reason}"
+
+        limits = self.bankroll.get_effective_limits()
 
         # Check correlation: don't stack too many positions on the same asset
         # Market maker gets its own higher limit — it's hedged (both sides)
@@ -132,14 +324,15 @@ class RiskManager:
         if len(same_asset) >= max_per_asset:
             return False, f"Too many positions on {signal.asset} ({len(same_asset)}/{max_per_asset})"
 
-        # MM-specific exposure cap
+        # MM-specific exposure cap (Kelly-scaled)
         if is_mm:
             mm_exposure = sum(
                 p.entry_cost for p in open_positions
                 if getattr(p, "strategy", "") == "market_maker"
             )
-            if mm_exposure >= MARKET_MAKER["max_exposure_usdc"]:
-                return False, f"MM exposure cap reached (${mm_exposure:.0f}/${MARKET_MAKER['max_exposure_usdc']:.0f})"
+            mm_cap = limits["mm_max_exposure_usdc"]
+            if mm_exposure >= mm_cap:
+                return False, f"MM exposure cap reached (${mm_exposure:.0f}/${mm_cap:.0f})"
 
         # Check if we're in a losing streak (skip for MM — spread trades
         # have different loss characteristics than directional bets)
@@ -154,7 +347,8 @@ class RiskManager:
         # MM uses its own exposure cap above, so skip this check for MM
         if not is_mm:
             current_exposure = sum(p.entry_cost for p in open_positions)
-            exposure_ratio = current_exposure / RISK["max_total_exposure_usdc"]
+            max_total = limits["max_total_exposure_usdc"]
+            exposure_ratio = current_exposure / max_total if max_total > 0 else 0
 
             if exposure_ratio > 0.5 and signal.edge < STRATEGY["min_edge"] * 1.5:
                 return False, (f"Edge too low for current exposure "
@@ -166,18 +360,20 @@ class RiskManager:
                     state: ExecutionState) -> float:
         """
         Adjust position size based on portfolio context.
+        Uses Kelly-scaled limits for dynamic bankroll growth.
 
         Returns the adjusted size (number of shares).
         """
+        limits = self.bankroll.get_effective_limits()
         base_size = signal.suggested_size
 
-        # Scale down as we approach max exposure
+        # Scale down as we approach max exposure (Kelly-scaled)
         open_positions = [p for p in state.positions if p.status == "open"]
         current_exposure = sum(p.entry_cost for p in open_positions)
-        remaining_capacity = RISK["max_total_exposure_usdc"] - current_exposure
+        remaining_capacity = limits["max_total_exposure_usdc"] - current_exposure
 
         max_cost = min(
-            RISK["max_position_usdc"],
+            limits["max_position_usdc"],
             remaining_capacity,
         )
 
@@ -190,9 +386,9 @@ class RiskManager:
         if signal.confidence < 0.5:
             base_size = max(1, int(base_size * 0.5))
 
-        # Scale down after losses
+        # Scale down after losses (using Kelly-scaled daily limit)
         if state.daily_pnl < 0:
-            loss_ratio = abs(state.daily_pnl) / RISK["daily_loss_limit_usdc"]
+            loss_ratio = abs(state.daily_pnl) / limits["daily_loss_limit_usdc"]
             scale = max(0.25, 1 - loss_ratio)
             base_size = max(1, int(base_size * scale))
 

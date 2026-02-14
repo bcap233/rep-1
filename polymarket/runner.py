@@ -40,7 +40,7 @@ from .exchanges import get_composite_price
 from .polymarket_client import PolymarketClient
 from .signals import Signal, generate_signals
 from .execution import ExecutionEngine
-from .risk import RiskManager
+from .risk import RiskManager, BankrollManager
 from .strategies import get_strategy, list_strategies, STRATEGIES, BaseStrategy
 
 logging.basicConfig(
@@ -233,6 +233,18 @@ def print_risk_report(risk_mgr: RiskManager, engine: ExecutionEngine):
     for w in report.warnings:
         print(f"  WARNING: {w}")
 
+    # Kelly bankroll info
+    if risk_mgr.bankroll:
+        bs = risk_mgr.bankroll.summary()
+        print(f"  Bankroll: ${bs['bankroll']:,.2f} / ${bs['initial']:,.2f} initial "
+              f"(cumulative PnL: ${bs['cumulative_pnl']:+,.2f})")
+        print(f"  Kelly: f*={bs['kelly_fraction']:.4f} → "
+              f"half-Kelly={bs['half_kelly']:.4f} → "
+              f"scale {bs['scale_factor']:.2f}x")
+        print(f"  Win rate: {bs['win_rate']:.1%} over {bs['trades_in_window']} trades")
+        if bs['drawdown'] > 0:
+            print(f"  Peak bankroll: ${bs['peak']:.2f} (drawdown: ${bs['drawdown']:.2f})")
+
     print()
 
 
@@ -320,6 +332,18 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
     Returns the number of trades executed.
     """
     trades_executed = 0
+
+    # Log Kelly bankroll status
+    if engine.bankroll:
+        b = engine.bankroll
+        scale = b.scale_factor()
+        if scale != 1.0 or len(b.trade_history) >= 10:
+            kelly_f = b.kelly_fraction()
+            logger.info(f"[KELLY] Bankroll ${b.bankroll:.0f} | "
+                        f"scale {scale:.2f}x | "
+                        f"Kelly f*={kelly_f:.3f} | "
+                        f"win rate {len([p for p in b.trade_history if p > 0])}"
+                        f"/{len(b.trade_history)}")
 
     # Step 1: Update existing positions (check stops/TPs)
     closed = engine.update_positions()
@@ -491,10 +515,11 @@ Examples:
     elif args.live:
         EXECUTION["mode"] = "live"
 
-    # Initialize components
+    # Initialize components — shared bankroll manager for Kelly reinvestment
     client = PolymarketClient()
-    engine = ExecutionEngine(client)
-    risk_mgr = RiskManager()
+    bankroll = BankrollManager()
+    engine = ExecutionEngine(client, bankroll_mgr=bankroll)
+    risk_mgr = RiskManager(bankroll_mgr=bankroll)
 
     interval = args.interval or EXECUTION["poll_interval"]
 

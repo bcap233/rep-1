@@ -244,6 +244,38 @@ RISK = {
 }
 
 # ============================================================
+# KELLY REINVESTMENT
+# ============================================================
+# Bankroll grows with profits; position sizing scales up sustainably.
+# Uses half-Kelly for conservative growth.
+
+KELLY = {
+    # Starting bankroll (paper or real USDC)
+    "initial_bankroll_usdc": 5_000.0,
+
+    # Kelly fraction multiplier (1.0 = full Kelly, 0.5 = half-Kelly)
+    # Half-Kelly gives ~75% of full-Kelly growth with much less variance.
+    "fraction": 0.5,
+
+    # Minimum trades before Kelly kicks in (need stats to compute it)
+    "min_trades_for_kelly": 20,
+
+    # Rolling window for Kelly calculation (last N closed trades)
+    "rolling_window": 100,
+
+    # Bankroll scale limits — never scale below 0.5x or above 3.0x base
+    "min_scale": 0.5,
+    "max_scale": 3.0,
+
+    # Drawdown throttle: if drawdown from peak exceeds this % of bankroll,
+    # scale back to 1.0x regardless of Kelly
+    "drawdown_throttle_pct": 0.15,
+
+    # Bankroll persistence file
+    "bankroll_file": "data/bankroll.json",
+}
+
+# ============================================================
 # EXECUTION
 # ============================================================
 

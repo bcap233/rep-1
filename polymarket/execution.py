@@ -119,9 +119,10 @@ class ExecutionEngine:
         engine.close_position(pos_id)  # Manual close
     """
 
-    def __init__(self, client: PolymarketClient):
+    def __init__(self, client: PolymarketClient, bankroll_mgr=None):
         self.client = client
         self.state = ExecutionState()
+        self.bankroll = bankroll_mgr  # Optional BankrollManager for Kelly reinvestment
         self._position_counter = 0
         self._load_state()
 
@@ -197,8 +198,18 @@ class ExecutionEngine:
 
         Returns (allowed, reason).
         """
-        # Daily loss limit
-        if self.state.daily_pnl <= -RISK["daily_loss_limit_usdc"]:
+        # Get Kelly-scaled limits if bankroll manager is available
+        if self.bankroll:
+            limits = self.bankroll.get_effective_limits()
+        else:
+            limits = {
+                "max_total_exposure_usdc": RISK["max_total_exposure_usdc"],
+                "max_position_usdc": RISK["max_position_usdc"],
+                "daily_loss_limit_usdc": RISK["daily_loss_limit_usdc"],
+            }
+
+        # Daily loss limit (Kelly-scaled)
+        if self.state.daily_pnl <= -limits["daily_loss_limit_usdc"]:
             return False, f"Daily loss limit hit (${self.state.daily_pnl:.2f})"
 
         # Max open positions
@@ -206,16 +217,18 @@ class ExecutionEngine:
         if open_count >= RISK["max_open_positions"]:
             return False, f"Max open positions ({RISK['max_open_positions']})"
 
-        # Max total exposure
+        # Max total exposure (Kelly-scaled)
         total_exposure = sum(p.entry_cost for p in self.state.positions if p.status == "open")
         new_cost = signal.suggested_price * signal.suggested_size
-        if total_exposure + new_cost > RISK["max_total_exposure_usdc"]:
+        max_exposure = limits["max_total_exposure_usdc"]
+        if total_exposure + new_cost > max_exposure:
             return False, (f"Max exposure (${total_exposure:.2f} + ${new_cost:.2f} > "
-                           f"${RISK['max_total_exposure_usdc']:.2f})")
+                           f"${max_exposure:.2f})")
 
-        # Single position limit
-        if new_cost > RISK["max_position_usdc"]:
-            return False, f"Position too large (${new_cost:.2f} > ${RISK['max_position_usdc']:.2f})"
+        # Single position limit (Kelly-scaled)
+        max_pos = limits["max_position_usdc"]
+        if new_cost > max_pos:
+            return False, f"Position too large (${new_cost:.2f} > ${max_pos:.2f})"
 
         # Cooldown check
         cooldown_until = self.state.cooldowns.get(signal.market.condition_id, 0)
@@ -527,6 +540,10 @@ class ExecutionEngine:
         pos.status = "closed"
 
         self.state.daily_pnl += pos.realized_pnl
+
+        # Record trade in bankroll for Kelly reinvestment
+        if self.bankroll:
+            self.bankroll.record_trade(pos.realized_pnl)
 
         logger.info(f"{'[PAPER] ' if mode == 'paper' else ''}Position closed: "
                      f"{pos.position_id} | reason={reason} | "
