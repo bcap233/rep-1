@@ -273,6 +273,9 @@ EXECUTION = {
 # Profit per win is small (5-15c) but win rate is very high.
 
 HIGH_PROB_GRINDER = {
+    # Watch-only mode: scan and log signals, but don't execute trades.
+    # Signal count/quality feeds into dynamic MM capital scaling.
+    "watch_only": True,
     # Buy tokens priced in this range (checks both YES and NO sides)
     "min_probability": 0.85,
     "max_probability": 0.97,
@@ -307,6 +310,9 @@ HIGH_PROB_GRINDER = {
 # cost is less than $1.00, locking in risk-free profit.
 
 BILATERAL_ARB = {
+    # Watch-only mode: scan and log signals, but don't execute trades.
+    # Signal count/quality feeds into dynamic MM capital scaling.
+    "watch_only": True,
     # Minimum gap after fees to execute each arb type
     "min_gap_intra": 0.02,   # Same-market YES+NO arb
     "min_gap_cross": 0.03,   # Cross-market complementary arb

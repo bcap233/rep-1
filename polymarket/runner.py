@@ -34,7 +34,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import STRATEGY, ASSETS, EXECUTION, RISK, DATA, TIMEFRAMES
+from .config import (STRATEGY, ASSETS, EXECUTION, RISK, DATA, TIMEFRAMES,
+                     HIGH_PROB_GRINDER, BILATERAL_ARB, MARKET_MAKER)
 from .exchanges import get_composite_price
 from .polymarket_client import PolymarketClient
 from .signals import Signal, generate_signals
@@ -254,6 +255,47 @@ def list_markets(client: PolymarketClient, assets: list[str]):
 # Core cycle
 # ============================================================
 
+_WATCH_ONLY_CONFIGS = {
+    "high_prob_grinder": HIGH_PROB_GRINDER,
+    "bilateral_arb": BILATERAL_ARB,
+}
+
+
+def _compute_mm_scale(scout_signals: list[Signal]) -> float:
+    """
+    Dynamically scale MM capital based on scout (watch-only) signal quality.
+
+    More scout signals = richer market = deploy more MM capital.
+    Returns a multiplier (1.0 = baseline, up to 2.5x).
+    """
+    if not scout_signals:
+        return 1.0
+
+    n_signals = len(scout_signals)
+    avg_edge = sum(s.edge for s in scout_signals) / n_signals
+    avg_conf = sum(s.confidence for s in scout_signals) / n_signals
+
+    # Signal count factor: 1-3 signals = 1.0x, 4-8 = 1.5x, 9+ = 2.0x
+    if n_signals >= 9:
+        count_factor = 2.0
+    elif n_signals >= 4:
+        count_factor = 1.0 + (n_signals - 3) * 0.1  # 1.1 → 1.5
+    else:
+        count_factor = 1.0
+
+    # Quality factor: avg edge * avg confidence, scaled
+    quality = avg_edge * avg_conf
+    quality_factor = 1.0 + min(1.0, quality * 20)  # 0.05 quality → 2.0x
+
+    # Arb signals are especially bullish for MM (market is inefficient)
+    arb_signals = [s for s in scout_signals if s.strategy == "bilateral_arb"]
+    arb_bonus = 1.0 + min(0.5, len(arb_signals) * 0.15)
+
+    scale = count_factor * quality_factor * arb_bonus
+    # Cap at 2.5x to avoid going crazy
+    return min(2.5, max(1.0, scale))
+
+
 def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
               risk_mgr: RiskManager, assets: list[str],
               quiet: bool = False) -> int:
@@ -277,33 +319,56 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
         logger.warning("Kill switch active — skipping signal generation")
         return 0
 
-    # Step 3: Collect signals from all strategies
-    all_signals = []
+    # Step 3: Collect signals — separate watch-only scouts from executable
+    executable_signals = []
+    scout_signals = []
     for strategy in strategies:
         try:
             logger.info(f"--- Running {strategy.name} ---")
             signals = strategy.scan(assets)
-            all_signals.extend(signals)
-            logger.info(f"  {strategy.name}: {len(signals)} signals")
+
+            # Check if this strategy is in watch-only mode
+            cfg = _WATCH_ONLY_CONFIGS.get(strategy.name)
+            is_watch_only = cfg.get("watch_only", False) if cfg else False
+
+            if is_watch_only:
+                scout_signals.extend(signals)
+                if signals:
+                    edges = [f"{s.edge:.3f}" for s in signals[:5]]
+                    logger.info(f"  {strategy.name}: {len(signals)} signals "
+                                f"(WATCH ONLY — edges: {', '.join(edges)})")
+                else:
+                    logger.info(f"  {strategy.name}: 0 signals (watch only)")
+            else:
+                executable_signals.extend(signals)
+                logger.info(f"  {strategy.name}: {len(signals)} signals")
         except Exception as e:
             logger.error(f"Strategy {strategy.name} error: {e}", exc_info=True)
 
     if not quiet:
-        print_signals(all_signals)
+        print_signals(executable_signals + scout_signals)
 
-    # Step 4: Execute signals (best first, across all strategies)
+    # Step 3b: Dynamic capital scaling — use scout intelligence to size MM
+    mm_scale = _compute_mm_scale(scout_signals)
+    if mm_scale > 1.0:
+        logger.info(f"[DYNAMIC] Scout intelligence → MM scale {mm_scale:.2f}x "
+                     f"({len(scout_signals)} scout signals)")
+
+    # Step 4: Execute signals (best first, across executable strategies only)
     # Sort all signals by edge * confidence for unified prioritization
-    all_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
+    executable_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
 
-    for sig in all_signals:
+    for sig in executable_signals:
         # Portfolio-level risk check
         allowed, reason = risk_mgr.pre_trade_check(sig, engine.state)
         if not allowed:
             logger.info(f"Signal filtered by risk manager: {reason}")
             continue
 
-        # Adjust size
+        # Adjust size — apply dynamic scale for MM signals
         adjusted_size = risk_mgr.adjust_size(sig, engine.state)
+        if sig.strategy == "market_maker" and mm_scale > 1.0:
+            adjusted_size = int(adjusted_size * mm_scale)
         sig.suggested_size = adjusted_size
 
         # Execute
