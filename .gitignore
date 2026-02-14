@@ -51,6 +51,7 @@ bot/bot.log
 polymarket/state.json
 polymarket/trades.jsonl
 polymarket/bot.log
+data/
 
 # Secrets
 .env
