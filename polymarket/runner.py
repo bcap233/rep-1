@@ -260,40 +260,55 @@ _WATCH_ONLY_CONFIGS = {
     "bilateral_arb": BILATERAL_ARB,
 }
 
+# Strategies whose signals feed into MM sizing instead of executing independently
+_FEED_INTO_MM = {"spot_divergence"}
 
-def _compute_mm_scale(scout_signals: list[Signal]) -> float:
+
+def _compute_mm_boost(scout_signals: list[Signal],
+                      feed_signals: list[Signal]) -> tuple[float, dict[str, float]]:
     """
-    Dynamically scale MM capital based on scout (watch-only) signal quality.
+    Compute MM sizing boost from scout and feed signals.
 
-    More scout signals = richer market = deploy more MM capital.
-    Returns a multiplier (1.0 = baseline, up to 2.5x).
+    scout_signals: watch-only strategies (grinder, bilateral)
+    feed_signals: strategies that amplify MM (spot_divergence)
+
+    Returns:
+        (global_scale, per_side_boost)
+        global_scale: 1.0-2.5x multiplier on all MM trades
+        per_side_boost: {"Up": 1.0-2.0, "Down": 1.0-2.0} directional boost
     """
-    if not scout_signals:
-        return 1.0
+    # --- Global scale from scouts ---
+    global_scale = 1.0
+    if scout_signals:
+        n = len(scout_signals)
+        avg_edge = sum(s.edge for s in scout_signals) / n
+        avg_conf = sum(s.confidence for s in scout_signals) / n
 
-    n_signals = len(scout_signals)
-    avg_edge = sum(s.edge for s in scout_signals) / n_signals
-    avg_conf = sum(s.confidence for s in scout_signals) / n_signals
+        count_factor = min(2.0, 1.0 + max(0, n - 3) * 0.1)
+        quality_factor = 1.0 + min(1.0, avg_edge * avg_conf * 20)
+        arb_count = sum(1 for s in scout_signals if s.strategy == "bilateral_arb")
+        arb_bonus = 1.0 + min(0.5, arb_count * 0.15)
 
-    # Signal count factor: 1-3 signals = 1.0x, 4-8 = 1.5x, 9+ = 2.0x
-    if n_signals >= 9:
-        count_factor = 2.0
-    elif n_signals >= 4:
-        count_factor = 1.0 + (n_signals - 3) * 0.1  # 1.1 → 1.5
-    else:
-        count_factor = 1.0
+        global_scale = min(2.5, count_factor * quality_factor * arb_bonus)
 
-    # Quality factor: avg edge * avg confidence, scaled
-    quality = avg_edge * avg_conf
-    quality_factor = 1.0 + min(1.0, quality * 20)  # 0.05 quality → 2.0x
+    # --- Directional boost from spot_divergence ---
+    per_side_boost: dict[str, float] = {"Up": 1.0, "Down": 1.0}
+    if feed_signals:
+        # Aggregate momentum direction from spot_div signals
+        up_edges = [s.edge * s.confidence for s in feed_signals
+                    if s.token_side in ("Up", "YES")]
+        down_edges = [s.edge * s.confidence for s in feed_signals
+                      if s.token_side in ("Down", "NO")]
 
-    # Arb signals are especially bullish for MM (market is inefficient)
-    arb_signals = [s for s in scout_signals if s.strategy == "bilateral_arb"]
-    arb_bonus = 1.0 + min(0.5, len(arb_signals) * 0.15)
+        # Strong spot_div conviction on a side → boost MM size on that side
+        if up_edges:
+            avg_up = sum(up_edges) / len(up_edges)
+            per_side_boost["Up"] = min(2.0, 1.0 + avg_up * 10)
+        if down_edges:
+            avg_down = sum(down_edges) / len(down_edges)
+            per_side_boost["Down"] = min(2.0, 1.0 + avg_down * 10)
 
-    scale = count_factor * quality_factor * arb_bonus
-    # Cap at 2.5x to avoid going crazy
-    return min(2.5, max(1.0, scale))
+    return global_scale, per_side_boost
 
 
 def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
@@ -319,9 +334,13 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
         logger.warning("Kill switch active — skipping signal generation")
         return 0
 
-    # Step 3: Collect signals — separate watch-only scouts from executable
+    # Step 3: Collect signals — three buckets:
+    #   executable: strategies that trade directly (market_maker)
+    #   scout: watch-only intelligence (grinder, bilateral)
+    #   feed: signals that boost MM sizing (spot_divergence)
     executable_signals = []
     scout_signals = []
+    feed_signals = []
     for strategy in strategies:
         try:
             logger.info(f"--- Running {strategy.name} ---")
@@ -339,6 +358,14 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
                                 f"(WATCH ONLY — edges: {', '.join(edges)})")
                 else:
                     logger.info(f"  {strategy.name}: 0 signals (watch only)")
+            elif strategy.name in _FEED_INTO_MM:
+                feed_signals.extend(signals)
+                if signals:
+                    sides = [s.token_side for s in signals]
+                    logger.info(f"  {strategy.name}: {len(signals)} signals "
+                                f"(FEED → MM boost: {', '.join(sides)})")
+                else:
+                    logger.info(f"  {strategy.name}: 0 signals")
             else:
                 executable_signals.extend(signals)
                 logger.info(f"  {strategy.name}: {len(signals)} signals")
@@ -346,16 +373,17 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
             logger.error(f"Strategy {strategy.name} error: {e}", exc_info=True)
 
     if not quiet:
-        print_signals(executable_signals + scout_signals)
+        print_signals(executable_signals + scout_signals + feed_signals)
 
-    # Step 3b: Dynamic capital scaling — use scout intelligence to size MM
-    mm_scale = _compute_mm_scale(scout_signals)
-    if mm_scale > 1.0:
-        logger.info(f"[DYNAMIC] Scout intelligence → MM scale {mm_scale:.2f}x "
-                     f"({len(scout_signals)} scout signals)")
+    # Step 3b: Dynamic capital scaling from all intelligence sources
+    mm_scale, side_boost = _compute_mm_boost(scout_signals, feed_signals)
+    if mm_scale > 1.0 or any(v > 1.0 for v in side_boost.values()):
+        logger.info(f"[DYNAMIC] MM scale {mm_scale:.2f}x | "
+                     f"Up boost {side_boost['Up']:.2f}x | "
+                     f"Down boost {side_boost['Down']:.2f}x | "
+                     f"({len(scout_signals)} scout, {len(feed_signals)} feed)")
 
     # Step 4: Execute signals (best first, across executable strategies only)
-    # Sort all signals by edge * confidence for unified prioritization
     executable_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
 
     for sig in executable_signals:
@@ -365,10 +393,15 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
             logger.info(f"Signal filtered by risk manager: {reason}")
             continue
 
-        # Adjust size — apply dynamic scale for MM signals
+        # Adjust size — apply dynamic scale + directional boost for MM
         adjusted_size = risk_mgr.adjust_size(sig, engine.state)
-        if sig.strategy == "market_maker" and mm_scale > 1.0:
-            adjusted_size = int(adjusted_size * mm_scale)
+        if sig.strategy == "market_maker":
+            boost = mm_scale
+            # Directional boost: spot_div says "bullish" → size up on Up side
+            if sig.token_side in side_boost:
+                boost *= side_boost[sig.token_side]
+            if boost > 1.0:
+                adjusted_size = int(adjusted_size * boost)
         sig.suggested_size = adjusted_size
 
         # Execute

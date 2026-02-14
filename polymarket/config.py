@@ -359,10 +359,10 @@ MARKET_MAKER = {
     "momentum_bias_weight": 0.05,
     # Only quote if we're at least this far from market expiry
     "min_minutes_to_expiry": 2,
-    # Max exposure across all MM positions
-    "max_exposure_usdc": 2_000.0,
+    # Max exposure across all MM positions (most of global $5k cap goes here)
+    "max_exposure_usdc": 3_500.0,
     # Max concurrent MM positions (each market = 1 position tracking both sides)
-    "max_positions": 30,
+    "max_positions": 50,
 }
 
 # ============================================================

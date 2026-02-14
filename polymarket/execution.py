@@ -238,12 +238,12 @@ class ExecutionEngine:
                             and p.status == "open"
                             and p.token_side == signal.token_side
                         ]
-                        if len(same_side) >= 3:
-                            return False, f"MM: max 3 layers on {signal.token_side} in this market"
-                        # Don't stack at the same price level (±1c)
-                        if any(abs(p.entry_price - signal.suggested_price) < 0.02
+                        if len(same_side) >= 5:
+                            return False, f"MM: max 5 layers on {signal.token_side} in this market"
+                        # Don't stack at the exact same price level (±1c)
+                        if any(abs(p.entry_price - signal.suggested_price) < 0.01
                                for p in same_side):
-                            return False, f"MM: already have {signal.token_side} near this price"
+                            return False, f"MM: already have {signal.token_side} at this price"
                         break  # Allow it — different price level, under 3 layers
                 else:
                     return False, f"Already have position in this market"
