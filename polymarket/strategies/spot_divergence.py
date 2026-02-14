@@ -136,6 +136,15 @@ class SpotDivergence(BaseStrategy):
                     continue
 
                 # --- Standard price-target markets ---
+                # Skip long-dated / meme markets — only trade short-duration
+                # markets where momentum actually matters
+                q_lower = market.question.lower()
+                _meme_keywords = ["gta", "before 20", "by 20", "end of 20",
+                                  "this year", "next year", "$1m", "$1,000,000",
+                                  "million", "all-time"]
+                if any(kw in q_lower for kw in _meme_keywords):
+                    continue
+
                 if not market.yes_token_id:
                     continue
 

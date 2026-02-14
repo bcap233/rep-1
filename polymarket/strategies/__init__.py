@@ -82,3 +82,4 @@ def list_strategies() -> list[tuple[str, str]]:
 from . import spot_divergence  # noqa: E402, F401
 from . import high_prob_grinder  # noqa: E402, F401
 from . import bilateral_arb  # noqa: E402, F401
+from . import market_maker  # noqa: E402, F401

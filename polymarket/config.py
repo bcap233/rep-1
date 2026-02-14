@@ -328,6 +328,38 @@ BILATERAL_ARB = {
 }
 
 # ============================================================
+# STRATEGY: MARKET MAKER
+# ============================================================
+# Post bids and asks on both sides of BTC Up/Down markets.
+# Profit comes from the spread, not from predicting direction.
+# Inventory risk is managed by skewing quotes toward neutral.
+
+MARKET_MAKER = {
+    # Which durations to make markets on
+    "durations": ["15m", "4h"],  # Skip 5m — too fast, fills before we can hedge
+    # Spread we want to capture (half-spread on each side)
+    "half_spread": 0.02,         # 2c on each side = 4c total spread
+    # Min spread in the book before we quote
+    "min_book_spread": 0.01,
+    # Size per side (USDC)
+    "size_per_side_usdc": 25.0,
+    # Max inventory imbalance before we stop quoting one side
+    # (net shares long or short on Up vs Down)
+    "max_inventory_shares": 100,
+    # Inventory skew: shift quotes to offload inventory
+    # At max inventory, shift by this many cents away from the heavy side
+    "inventory_skew_max": 0.03,
+    # Use spot momentum to bias fair value (lean into trends)
+    "momentum_bias_weight": 0.05,
+    # Only quote if we're at least this far from market expiry
+    "min_minutes_to_expiry": 2,
+    # Max exposure across all MM positions
+    "max_exposure_usdc": 500.0,
+    # Max concurrent MM positions (each market = 1 position tracking both sides)
+    "max_positions": 10,
+}
+
+# ============================================================
 # NOTIFICATIONS
 # ============================================================
 
