@@ -91,6 +91,11 @@ class Signal:
         return len(self.arb_legs) >= 2
 
 
+def is_updown_market(question: str) -> bool:
+    """Check if a market is a Bitcoin Up or Down short-duration market."""
+    return "up or down" in question.lower()
+
+
 def extract_target_price(question: str) -> tuple[Optional[float], str]:
     """
     Extract the price target and direction from a Polymarket question.
@@ -99,8 +104,15 @@ def extract_target_price(question: str) -> tuple[Optional[float], str]:
         "Will Bitcoin be above $100,000 on March 1?" → (100000.0, "above")
         "Will ETH reach $5,000 by end of Q1?"        → (5000.0, "above")
         "Will BTC drop below $80,000?"                → (80000.0, "below")
+
+    For "Up or Down" markets, returns (0.0, "updown") as a sentinel.
+    These markets don't have a price target — they're pure directional bets.
     """
     q = question.lower()
+
+    # Up or Down markets: no price target, pure directional
+    if "up or down" in q:
+        return 0.0, "updown"
 
     # Determine direction
     if any(kw in q for kw in ["above", "over", "higher than", "reach", "hit", "exceed"]):
@@ -128,6 +140,45 @@ def extract_target_price(question: str) -> tuple[Optional[float], str]:
             return val, direction
 
     return None, direction
+
+
+def estimate_updown_fair_probability(
+    momentum_score: float,
+    roc_pct: float,
+    volume_ratio: float = 1.0,
+) -> float:
+    """
+    Estimate the fair probability that BTC goes "Up" in a short-duration window.
+
+    For Up/Down markets, there's no price target — it's simply whether
+    the price is higher or lower at the end of the window vs the start.
+
+    Inputs:
+      - momentum_score: -1.0 (bearish) to +1.0 (bullish) from chart analysis
+      - roc_pct: recent rate of change (%) — directional momentum
+      - volume_ratio: current volume / average volume — conviction strength
+
+    Returns probability of "Up" outcome (0.02 to 0.98).
+    """
+    # Base: 50/50 (no edge without signal)
+    base = 0.50
+
+    # Momentum drives direction: strong momentum = higher probability
+    # Scale: ±0.20 max from momentum alone
+    momentum_adj = momentum_score * 0.20
+
+    # ROC provides extrapolation: if moving up fast, likely continues
+    # Cap at ±0.10
+    roc_adj = max(-0.10, min(0.10, roc_pct * 0.04))
+
+    # High volume confirms the move
+    if volume_ratio > 1.5:
+        volume_adj = 0.03 * (1 if momentum_score > 0 else -1)
+    else:
+        volume_adj = 0.0
+
+    fair = base + momentum_adj + roc_adj + volume_adj
+    return max(0.02, min(0.98, fair))
 
 
 def estimate_fair_probability(
@@ -300,6 +351,20 @@ def generate_signals(
             if target_price is None:
                 continue
 
+            # Use best available ROC for estimation
+            best_roc = analyses[0].roc_3 if analyses else 0.0
+
+            # --- Up/Down markets: pure directional bet ---
+            if direction == "updown":
+                signal = _evaluate_updown_signal(
+                    client, asset, market, spot_price,
+                    consensus_score, consensus_dir, confirming, analyses, best_roc,
+                )
+                if signal:
+                    all_signals.append(signal)
+                continue
+
+            # --- Standard price-target markets ---
             # Get order book for YES token
             if not market.yes_token_id:
                 continue
@@ -314,9 +379,6 @@ def generate_signals(
                 continue
 
             implied_prob = book.midpoint
-
-            # Use best available ROC for estimation
-            best_roc = analyses[0].roc_3 if analyses else 0.0
 
             # Estimate fair probability
             fair_prob = estimate_fair_probability(
@@ -425,3 +487,100 @@ def generate_signals(
     # Sort by edge * confidence (best opportunities first)
     all_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
     return all_signals
+
+
+def _evaluate_updown_signal(
+    client: PolymarketClient,
+    asset: str, market: Market, spot_price: float,
+    consensus_score: float, consensus_dir: str,
+    confirming: int, analyses: list, best_roc: float,
+) -> Optional[Signal]:
+    """
+    Evaluate a Bitcoin "Up or Down" market for a trade signal.
+
+    Outcomes: token_ids[0] = "Up", token_ids[1] = "Down".
+    If momentum is bullish → buy "Up" when underpriced.
+    If momentum is bearish → buy "Down" when underpriced.
+    """
+    if len(market.token_ids) < 2:
+        return None
+
+    up_token_id = market.token_ids[0]
+    down_token_id = market.token_ids[1]
+
+    volume_ratio = analyses[0].volume_ratio if analyses else 1.0
+    fair_up = estimate_updown_fair_probability(
+        momentum_score=consensus_score,
+        roc_pct=best_roc,
+        volume_ratio=volume_ratio,
+    )
+
+    if consensus_dir == "bullish":
+        token_id = up_token_id
+        token_side = "Up"
+        fair_prob = fair_up
+    elif consensus_dir == "bearish":
+        token_id = down_token_id
+        token_side = "Down"
+        fair_prob = 1.0 - fair_up
+    else:
+        return None
+
+    book = client.get_order_book(token_id)
+    if not book:
+        return None
+
+    if book.spread > STRATEGY["max_spread"]:
+        return None
+
+    implied_prob = book.midpoint
+    edge = fair_prob - implied_prob
+
+    if edge < STRATEGY["min_edge"]:
+        return None
+
+    suggested_price = min(book.best_ask, implied_prob + edge * 0.5)
+
+    confidence = min(1.0, (
+        abs(consensus_score) * STRATEGY["weights"]["momentum"] +
+        min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"] +
+        (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"] +
+        min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"] +
+        (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
+    ))
+
+    from .config import RISK
+    max_size = RISK["max_position_usdc"]
+    suggested_size = max_size * confidence * min(1.0, edge / 0.10)
+    suggested_size = max(1, round(suggested_size / suggested_price))
+
+    signal = Signal(
+        asset=asset,
+        market=market,
+        token_id=token_id,
+        side="BUY",
+        token_side=token_side,
+        spot_price=spot_price,
+        target_price=0.0,
+        implied_prob=implied_prob,
+        fair_prob=fair_prob,
+        edge=edge,
+        confidence=confidence,
+        momentum_score=consensus_score,
+        momentum_direction=consensus_dir,
+        confirming_timeframes=confirming,
+        suggested_price=round(suggested_price, 2),
+        suggested_size=suggested_size,
+        timestamp=time.time(),
+        reason=(
+            f"BTC-UPDOWN: {consensus_dir} ({consensus_score:+.2f}) on "
+            f"{confirming}/{len(analyses)} TFs | "
+            f"spot=${spot_price:,.0f} | "
+            f"BUY {token_side} edge={edge:.3f} ({edge*100:.1f}c)"
+        ),
+    )
+
+    logger.info(f"  SIGNAL: BUY {token_side} on "
+                 f"\"{market.question[:50]}...\" | "
+                 f"edge={edge:.3f} conf={confidence:.2f}")
+    return signal

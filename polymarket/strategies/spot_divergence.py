@@ -24,7 +24,10 @@ from ..charts import analyze_all_timeframes, multi_timeframe_consensus
 from ..config import STRATEGY, TIMEFRAMES, ASSETS, RISK
 from ..exchanges import get_composite_price, get_best_candles
 from ..polymarket_client import PolymarketClient, Market
-from ..signals import Signal, extract_target_price, estimate_fair_probability
+from ..signals import (
+    Signal, extract_target_price, estimate_fair_probability,
+    is_updown_market, estimate_updown_fair_probability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,19 @@ class SpotDivergence(BaseStrategy):
                 if target_price is None:
                     continue
 
+                best_roc = analyses[0].roc_3 if analyses else 0.0
+
+                # --- Up/Down markets: pure directional bet ---
+                if direction == "updown":
+                    signal = self._evaluate_updown_market(
+                        asset, market, spot_price, consensus_score,
+                        consensus_dir, confirming, analyses, best_roc,
+                    )
+                    if signal:
+                        all_signals.append(signal)
+                    continue
+
+                # --- Standard price-target markets ---
                 if not market.yes_token_id:
                     continue
 
@@ -131,7 +147,6 @@ class SpotDivergence(BaseStrategy):
                     continue
 
                 implied_prob = book.midpoint
-                best_roc = analyses[0].roc_3 if analyses else 0.0
 
                 fair_prob = estimate_fair_probability(
                     spot_price=spot_price,
@@ -234,3 +249,103 @@ class SpotDivergence(BaseStrategy):
 
         all_signals.sort(key=lambda s: s.edge * s.confidence, reverse=True)
         return all_signals
+
+    def _evaluate_updown_market(
+        self, asset: str, market, spot_price: float,
+        consensus_score: float, consensus_dir: str,
+        confirming: int, analyses: list, best_roc: float,
+    ):
+        """
+        Evaluate a Bitcoin "Up or Down" market for a trade signal.
+
+        These markets have outcomes ["Up", "Down"] instead of price targets.
+        Token 0 = "Up", Token 1 = "Down".
+
+        If momentum is bullish → buy "Up" when it's underpriced.
+        If momentum is bearish → buy "Down" when it's underpriced.
+        """
+        if len(market.token_ids) < 2:
+            return None
+
+        up_token_id = market.token_ids[0]   # "Up" outcome
+        down_token_id = market.token_ids[1]  # "Down" outcome
+
+        # Get fair probability of "Up"
+        volume_ratio = analyses[0].volume_ratio if analyses else 1.0
+        fair_up = estimate_updown_fair_probability(
+            momentum_score=consensus_score,
+            roc_pct=best_roc,
+            volume_ratio=volume_ratio,
+        )
+
+        # Choose which side to trade based on momentum direction
+        if consensus_dir == "bullish":
+            token_id = up_token_id
+            token_side = "Up"
+            fair_prob = fair_up
+        elif consensus_dir == "bearish":
+            token_id = down_token_id
+            token_side = "Down"
+            fair_prob = 1.0 - fair_up
+        else:
+            return None  # Neutral momentum → no signal
+
+        book = self.client.get_order_book(token_id)
+        if not book:
+            return None
+
+        if book.spread > STRATEGY["max_spread"]:
+            return None
+
+        implied_prob = book.midpoint
+        edge = fair_prob - implied_prob
+
+        if edge < STRATEGY["min_edge"]:
+            return None
+
+        price = min(book.best_ask, implied_prob + edge * 0.5)
+
+        # Confidence
+        confidence = min(1.0, (
+            abs(consensus_score) * STRATEGY["weights"]["momentum"]
+            + min(1, abs(analyses[0].vwap_deviation) / 0.5) * STRATEGY["weights"]["vwap_dev"]
+            + (1 if analyses[0].rsi > 60 or analyses[0].rsi < 40 else 0.5) * STRATEGY["weights"]["rsi"]
+            + min(1, analyses[0].volume_ratio / 2) * STRATEGY["weights"]["volume"]
+            + (confirming / len(analyses)) * STRATEGY["weights"]["multi_tf"]
+        ))
+
+        max_size = RISK["max_position_usdc"]
+        suggested_size = max_size * confidence * min(1.0, edge / 0.10)
+        suggested_size = max(1, round(suggested_size / price))
+
+        signal = Signal(
+            asset=asset,
+            market=market,
+            token_id=token_id,
+            side="BUY",
+            token_side=token_side,
+            spot_price=spot_price,
+            target_price=0.0,
+            implied_prob=implied_prob,
+            fair_prob=fair_prob,
+            edge=edge,
+            confidence=confidence,
+            momentum_score=consensus_score,
+            momentum_direction=consensus_dir,
+            confirming_timeframes=confirming,
+            suggested_price=round(price, 2),
+            suggested_size=suggested_size,
+            timestamp=time.time(),
+            reason=(
+                f"BTC-UPDOWN: {consensus_dir} ({consensus_score:+.2f}) "
+                f"{confirming}/{len(analyses)} TFs | "
+                f"spot=${spot_price:,.0f} | "
+                f"BUY {token_side} edge={edge:.3f}"
+            ),
+            strategy="spot_divergence",
+        )
+
+        logger.info(f"  SIGNAL: BUY {token_side} | "
+                     f"edge={edge:.3f} conf={confidence:.2f} | "
+                     f"\"{market.question[:50]}...\"")
+        return signal

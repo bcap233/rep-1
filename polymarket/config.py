@@ -123,6 +123,7 @@ ASSETS = {
         "coinbase": "BTC-USD",
         "kraken": "XXBTZUSD",
         "polymarket_tags": ["bitcoin", "btc"],
+        "updown_enabled": True,
     },
     "ETH": {
         "binance": "ETHUSDT",
@@ -145,6 +146,31 @@ ASSETS = {
 # interval and computes momentum indicators.
 
 TIMEFRAMES = [5, 10, 15]  # minutes
+
+# ============================================================
+# BTC UP/DOWN SHORT-DURATION MARKETS
+# ============================================================
+# These markets follow a deterministic slug pattern on Polymarket:
+#   btc-updown-{duration}-{aligned_unix_timestamp}
+# They are not discoverable via the Gamma search API.
+
+BTC_UPDOWN_DURATIONS = {
+    "5m": {
+        "interval_seconds": 300,
+        "offset_seconds": 0,
+        "label": "5-Minute",
+    },
+    "15m": {
+        "interval_seconds": 900,
+        "offset_seconds": 0,
+        "label": "15-Minute",
+    },
+    "4h": {
+        "interval_seconds": 14400,
+        "offset_seconds": 3600,    # 4h blocks start at :00 ET (01:00 UTC)
+        "label": "4-Hour",
+    },
+}
 
 # ============================================================
 # STRATEGY PARAMETERS

@@ -283,6 +283,7 @@ class PolymarketClient:
         Find active Polymarket markets related to a crypto asset's price.
 
         Searches for markets like "Will BTC be above $X?" or "Bitcoin price on [date]".
+        Also discovers short-duration "Up or Down" markets for BTC.
         """
         from .config import ASSETS
         tags = ASSETS.get(asset, {}).get("polymarket_tags", [asset.lower()])
@@ -292,6 +293,11 @@ class PolymarketClient:
             markets = self.search_markets(tag, limit=50)
             all_markets.extend(markets)
 
+        # Include short-duration Up/Down markets for BTC
+        if asset.upper() == "BTC":
+            updown = self.find_btc_updown_markets()
+            all_markets.extend(updown)
+
         # Deduplicate by condition_id
         seen = set()
         unique = []
@@ -300,9 +306,9 @@ class PolymarketClient:
                 seen.add(m.condition_id)
                 unique.append(m)
 
-        # Filter for price-related markets
+        # Filter for price-related markets (Up/Down markets pass via "up" keyword)
         price_keywords = ["price", "above", "below", "reach", "hit",
-                          "over", "under", "higher", "lower"]
+                          "over", "under", "higher", "lower", "up or down"]
         price_markets = []
         for m in unique:
             q = m.question.lower()
@@ -310,6 +316,81 @@ class PolymarketClient:
                 price_markets.append(m)
 
         return price_markets
+
+    def find_btc_updown_markets(self, durations: list[str] | None = None) -> list[Market]:
+        """
+        Discover short-duration Bitcoin "Up or Down" markets.
+
+        These markets (5m, 15m, 4h) are not returned by the Gamma search API.
+        They follow a deterministic slug pattern based on the current time:
+            btc-updown-{duration}-{aligned_unix_timestamp}
+
+        Returns the current and next upcoming markets for each duration.
+        """
+        from .config import BTC_UPDOWN_DURATIONS
+
+        if durations is None:
+            durations = list(BTC_UPDOWN_DURATIONS.keys())
+
+        now = int(time.time())
+        markets = []
+
+        for dur in durations:
+            dur_cfg = BTC_UPDOWN_DURATIONS.get(dur)
+            if not dur_cfg:
+                continue
+
+            interval = dur_cfg["interval_seconds"]
+            offset = dur_cfg["offset_seconds"]
+
+            # Align to the current window start
+            current_start = ((now - offset) // interval) * interval + offset
+
+            # Fetch current window + next window (and previous for recently-closed)
+            for ts in [current_start - interval, current_start, current_start + interval]:
+                slug = f"btc-updown-{dur}-{ts}"
+                url = f"{self.gamma_url}/events?slug={slug}"
+                data = _http_get(url)
+                if not data:
+                    continue
+
+                ev = data[0] if isinstance(data, list) and data else None
+                if not ev:
+                    continue
+
+                for m_data in ev.get("markets", []):
+                    clob_token_ids = m_data.get("clobTokenIds", [])
+                    outcomes = m_data.get("outcomes", [])
+                    if isinstance(outcomes, str):
+                        outcomes = json.loads(outcomes)
+                    if isinstance(clob_token_ids, str):
+                        clob_token_ids = json.loads(clob_token_ids)
+
+                    end_date = m_data.get("endDate", "")
+                    closed = m_data.get("closed", False)
+                    active = m_data.get("active", True)
+
+                    # Skip already-closed markets
+                    if closed:
+                        continue
+
+                    markets.append(Market(
+                        condition_id=m_data.get("conditionId", ""),
+                        question=m_data.get("question", ev.get("title", "")),
+                        description=m_data.get("description", ""),
+                        outcomes=outcomes,
+                        token_ids=clob_token_ids,
+                        end_date=end_date,
+                        active=active,
+                        closed=closed,
+                        volume=float(m_data.get("volume", 0)),
+                        liquidity=float(m_data.get("liquidity", 0)),
+                        tags=["crypto", "bitcoin", "btc-updown", dur],
+                    ))
+
+        logger.info(f"BTC Up/Down discovery: {len(markets)} active markets "
+                     f"across {durations}")
+        return markets
 
     def search_all_categories(self, limit_per_query: int = 100) -> list[Market]:
         """
