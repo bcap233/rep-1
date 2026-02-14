@@ -108,7 +108,9 @@ def _http_get(url: str, timeout: int = 10) -> Optional[dict | list]:
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
-        logger.warning(f"HTTP {e.code} from {url}: {body_text[:200]}")
+        # 404s are expected for expired markets — don't spam the log
+        lvl = logging.DEBUG if e.code == 404 else logging.WARNING
+        logger.log(lvl, f"HTTP {e.code} from {url}: {body_text[:200]}")
         return None
     except Exception as e:
         logger.warning(f"Request failed for {url}: {e}")

@@ -78,6 +78,36 @@ class ExecutionState:
     last_update: float = 0.0
 
 
+def _calc_stop(signal, price: float) -> float:
+    """Calculate stop loss price. MM uses tighter, symmetric stops."""
+    is_mm = getattr(signal, "strategy", "") == "market_maker"
+    if is_mm:
+        # MM edge is spread-based (2-4c). Use 8c stop — 2x the spread.
+        sl_dist = 0.08
+    else:
+        sl_dist = RISK["stop_loss"]
+
+    if signal.side == "BUY":
+        return max(0.01, price - sl_dist)
+    return min(0.99, price + sl_dist)
+
+
+def _calc_tp(signal, price: float) -> float:
+    """Calculate take profit price. MM uses tighter, symmetric TPs."""
+    is_mm = getattr(signal, "strategy", "") == "market_maker"
+    if is_mm:
+        # MM TP at 8c — symmetric with stop for clean 1:1 risk/reward.
+        # We win more often than we lose (spread capture + momentum bias),
+        # so 1:1 payout with >50% win rate = positive EV.
+        tp_dist = 0.08
+    else:
+        tp_dist = RISK["take_profit"]
+
+    if signal.side == "BUY":
+        return min(0.99, price + tp_dist)
+    return max(0.01, price - tp_dist)
+
+
 class ExecutionEngine:
     """
     Manages trade execution and position lifecycle.
@@ -194,14 +224,27 @@ class ExecutionEngine:
             return False, f"Cooldown active ({remaining:.0f}s remaining)"
 
         # Don't double up on same market
-        # MM can hold both sides (Up + Down) of the same market, but not
-        # duplicate the same side
+        # MM can hold both sides (Up + Down) of the same market, and can
+        # stack up to 3 positions per side at different price levels
         is_mm = getattr(signal, "strategy", "") == "market_maker"
         for pos in self.state.positions:
             if pos.condition_id == signal.market.condition_id and pos.status == "open":
                 if is_mm:
                     if pos.token_side == signal.token_side:
-                        return False, f"MM: already have {signal.token_side} in this market"
+                        # Count existing positions on this side of this market
+                        same_side = [
+                            p for p in self.state.positions
+                            if p.condition_id == signal.market.condition_id
+                            and p.status == "open"
+                            and p.token_side == signal.token_side
+                        ]
+                        if len(same_side) >= 3:
+                            return False, f"MM: max 3 layers on {signal.token_side} in this market"
+                        # Don't stack at the same price level (±1c)
+                        if any(abs(p.entry_price - signal.suggested_price) < 0.02
+                               for p in same_side):
+                            return False, f"MM: already have {signal.token_side} near this price"
+                        break  # Allow it — different price level, under 3 layers
                 else:
                     return False, f"Already have position in this market"
 
@@ -286,8 +329,8 @@ class ExecutionEngine:
             entry_time=now,
             entry_order_id=order_id,
             current_price=price,
-            stop_loss_price=max(0.01, price - RISK["stop_loss"]) if signal.side == "BUY" else min(0.99, price + RISK["stop_loss"]),
-            take_profit_price=min(0.99, price + RISK["take_profit"]) if signal.side == "BUY" else max(0.01, price - RISK["take_profit"]),
+            stop_loss_price=_calc_stop(signal, price),
+            take_profit_price=_calc_tp(signal, price),
             max_hold_until=now + RISK["max_hold_minutes"] * 60,
             strategy=getattr(signal, "strategy", ""),
         )

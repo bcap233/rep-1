@@ -182,9 +182,12 @@ class MarketMaker(BaseStrategy):
             if duration not in self.cfg["durations"]:
                 continue
 
-            # Check time to expiry
+            # Check time to expiry — skip before fetching books to avoid 404s
             mins_left = _minutes_to_market_end(q)
             if mins_left is not None and mins_left < self.cfg["min_minutes_to_expiry"]:
+                continue
+            if mins_left is None:
+                # Can't parse end time — might be expired, skip it
                 continue
 
             # Need both token IDs

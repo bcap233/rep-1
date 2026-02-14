@@ -237,7 +237,7 @@ RISK = {
     "max_hold_minutes": 120,
 
     # Cooldown after a loss (seconds). Don't trade the same market.
-    "loss_cooldown_seconds": 120,
+    "loss_cooldown_seconds": 30,
 
     # Daily loss limit (USDC). Stop trading for the day if hit.
     "daily_loss_limit_usdc": 200.0,
