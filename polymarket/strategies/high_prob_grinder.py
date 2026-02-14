@@ -72,7 +72,7 @@ _DEFAULTS = {
     "size_per_trade_usdc": 20.0,
     "max_positions": 50,
     "max_exposure_usdc": 2_000.0,
-    "min_hours_to_expiry": 2,
+    "min_hours_to_expiry": 0,
     "max_days_to_expiry": 365,
     "favored_keywords": [
         "will", "above", "below", "reach", "remain",

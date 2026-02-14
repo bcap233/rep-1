@@ -264,7 +264,7 @@ HIGH_PROB_GRINDER = {
     "max_positions": 50,
     "max_exposure_usdc": 2_000.0,
     # Time-to-expiry window
-    "min_hours_to_expiry": 2,
+    "min_hours_to_expiry": 0,  # Allow markets about to resolve
     "max_days_to_expiry": 365,  # Allow long-dated markets (politics, sports seasons)
     # Number of markets to scan per cycle (per query)
     "scan_limit": 200,
