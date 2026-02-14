@@ -28,22 +28,42 @@ Filters:
 """
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
-from ..config import ASSETS, HIGH_PROB_GRINDER
+from ..config import ASSETS, HIGH_PROB_GRINDER, EVENT_CATEGORIES
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
 logger = logging.getLogger(__name__)
 
+
+def _classify_market(question_lower: str) -> str:
+    """Classify a market into a category label based on its question text."""
+    # Try crypto assets first (word-boundary match to avoid false positives
+    # like "sol" matching "soliciting" or "eth" matching "Yesilgoz")
+    for asset, cfg in ASSETS.items():
+        tags = cfg.get("polymarket_tags", [])
+        if any(re.search(rf'\b{re.escape(t)}\b', question_lower) for t in tags):
+            return asset
+
+    # Then try event categories
+    for cat_name, cat_cfg in EVENT_CATEGORIES.items():
+        for query in cat_cfg["queries"]:
+            if query in question_lower:
+                return cat_cfg["label"]
+
+    return "MISC"
+
+
 # Default config — merged with config.py overrides at init
 _DEFAULTS = {
-    "min_probability": 0.90,
+    "min_probability": 0.85,
     "max_probability": 0.97,
-    "sweet_spot_low": 0.91,
+    "sweet_spot_low": 0.88,
     "sweet_spot_high": 0.95,
     "min_liquidity": 5_000,
     "min_volume": 10_000,
@@ -53,7 +73,7 @@ _DEFAULTS = {
     "max_positions": 50,
     "max_exposure_usdc": 2_000.0,
     "min_hours_to_expiry": 2,
-    "max_days_to_expiry": 30,
+    "max_days_to_expiry": 365,
     "favored_keywords": [
         "will", "above", "below", "reach", "remain",
         "stay", "end", "close",
@@ -123,9 +143,13 @@ class HighProbGrinder(BaseStrategy):
         """
         logger.info(f"[GRINDER] Scanning for >{self.cfg['min_probability']*100:.0f}% events...")
 
-        # Fetch a broad set of active markets
-        all_markets = self.client.search_markets("", limit=self.cfg["scan_limit"],
-                                                  active_only=True)
+        # Fetch markets: broad scan + category-specific searches
+        if self.cfg.get("category_scan", True):
+            all_markets = self.client.search_all_categories(
+                limit_per_query=self.cfg["scan_limit"])
+        else:
+            all_markets = self.client.search_markets(
+                "", limit=self.cfg["scan_limit"], active_only=True)
 
         if not all_markets:
             logger.warning("[GRINDER] No markets returned from search")
@@ -171,106 +195,104 @@ class HighProbGrinder(BaseStrategy):
                     filtered_expiry += 1
                     continue
 
-            # Get YES token order book
-            if not market.yes_token_id:
+            # Check both YES and NO tokens for high-probability side
+            candidates = []
+            if market.yes_token_id:
+                candidates.append((market.yes_token_id, "YES"))
+            if market.no_token_id:
+                candidates.append((market.no_token_id, "NO"))
+
+            if not candidates:
                 continue
 
-            book = self.client.get_order_book(market.yes_token_id)
-            if not book:
-                continue
+            for token_id, token_side in candidates:
+                book = self.client.get_order_book(token_id)
+                if not book:
+                    continue
 
-            scanned += 1
-            yes_price = book.midpoint
+                scanned += 1
+                mid = book.midpoint
 
-            # Check probability range
-            if yes_price < self.cfg["min_probability"] or yes_price > self.cfg["max_probability"]:
-                filtered_prob += 1
-                continue
+                # Check probability range
+                if mid < self.cfg["min_probability"] or mid > self.cfg["max_probability"]:
+                    filtered_prob += 1
+                    continue
 
-            # Check spread
-            if book.spread > self.cfg["max_spread"]:
-                filtered_spread += 1
-                continue
+                # Check spread
+                if book.spread > self.cfg["max_spread"]:
+                    filtered_spread += 1
+                    continue
 
-            # Check depth at best ask
-            ask_depth = sum(size for _, size in book.asks[:3])  # Top 3 levels
-            if ask_depth < self.cfg["min_ask_depth"]:
-                continue
+                # Check depth at best ask
+                ask_depth = sum(size for _, size in book.asks[:3])
+                if ask_depth < self.cfg["min_ask_depth"]:
+                    continue
 
-            # Calculate position sizing
-            entry_price = book.best_ask  # We buy at the ask
-            if entry_price > self.cfg["max_probability"]:
-                continue
+                # Calculate position sizing
+                entry_price = book.best_ask
+                if entry_price > self.cfg["max_probability"]:
+                    continue
 
-            profit_per_share = 1.0 - entry_price      # Profit if YES
-            loss_per_share = entry_price               # Loss if NO
-            implied_prob = entry_price
-            # We assume true probability is slightly higher than implied
-            # (market tends to under-price near-certainties due to opportunity cost)
-            estimated_true_prob = min(0.99, implied_prob + 0.02)
+                profit_per_share = 1.0 - entry_price
+                loss_per_share = entry_price
+                implied_prob = entry_price
+                estimated_true_prob = min(0.99, implied_prob + 0.02)
 
-            ev_per_share = (estimated_true_prob * profit_per_share -
-                            (1 - estimated_true_prob) * loss_per_share)
+                ev_per_share = (estimated_true_prob * profit_per_share -
+                                (1 - estimated_true_prob) * loss_per_share)
 
-            if ev_per_share < self.cfg["min_edge"] * profit_per_share:
-                continue
+                if ev_per_share < self.cfg["min_edge"] * profit_per_share:
+                    continue
 
-            # Size: fixed USDC per trade
-            size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
+                size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
 
-            # Confidence: higher for sweet spot, lower at edges
-            if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
-                confidence = 0.85
-            else:
-                confidence = 0.65
+                # Confidence: higher for sweet spot, lower at edges
+                if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
+                    confidence = 0.85
+                else:
+                    confidence = 0.65
 
-            # Bonus confidence for favored keywords
-            if any(kw in q for kw in self.cfg["favored_keywords"]):
-                confidence = min(1.0, confidence + 0.10)
+                # Bonus confidence for favored keywords
+                if any(kw in q for kw in self.cfg["favored_keywords"]):
+                    confidence = min(1.0, confidence + 0.10)
 
-            # Bonus for high volume (better price discovery)
-            if market.volume > 100_000:
-                confidence = min(1.0, confidence + 0.05)
+                # Bonus for high volume (better price discovery)
+                if market.volume > 100_000:
+                    confidence = min(1.0, confidence + 0.05)
 
-            edge = ev_per_share
+                edge = ev_per_share
+                asset = _classify_market(q)
 
-            # Determine asset tag (best effort)
-            asset = "MISC"
-            for a, cfg in ASSETS.items():
-                tags = cfg.get("polymarket_tags", [])
-                if any(t in q for t in tags):
-                    asset = a
-                    break
+                signal = Signal(
+                    asset=asset,
+                    market=market,
+                    token_id=token_id,
+                    side="BUY",
+                    token_side=token_side,
+                    spot_price=0.0,
+                    target_price=0.0,
+                    implied_prob=implied_prob,
+                    fair_prob=estimated_true_prob,
+                    edge=edge,
+                    confidence=confidence,
+                    momentum_score=0.0,
+                    momentum_direction="n/a",
+                    confirming_timeframes=0,
+                    suggested_price=round(entry_price, 2),
+                    suggested_size=size,
+                    timestamp=time.time(),
+                    reason=(
+                        f"GRINDER: {token_side}@{entry_price:.2f} | "
+                        f"profit/loss={profit_per_share:.2f}/{loss_per_share:.2f} | "
+                        f"EV={ev_per_share:+.4f}/share | "
+                        f"liq=${market.liquidity:,.0f} vol=${market.volume:,.0f}"
+                    ),
+                    strategy="high_prob_grinder",
+                )
 
-            signal = Signal(
-                asset=asset,
-                market=market,
-                token_id=market.yes_token_id,
-                side="BUY",
-                token_side="YES",
-                spot_price=0.0,  # N/A for this strategy
-                target_price=0.0,
-                implied_prob=implied_prob,
-                fair_prob=estimated_true_prob,
-                edge=edge,
-                confidence=confidence,
-                momentum_score=0.0,
-                momentum_direction="n/a",
-                confirming_timeframes=0,
-                suggested_price=round(entry_price, 2),
-                suggested_size=size,
-                timestamp=time.time(),
-                reason=(
-                    f"GRINDER: YES@{entry_price:.2f} | "
-                    f"profit/loss={profit_per_share:.2f}/{loss_per_share:.2f} | "
-                    f"EV={ev_per_share:+.4f}/share | "
-                    f"liq=${market.liquidity:,.0f} vol=${market.volume:,.0f}"
-                ),
-                strategy="high_prob_grinder",
-            )
-
-            signals.append(signal)
-            self._seen_conditions.add(market.condition_id)
+                signals.append(signal)
+                self._seen_conditions.add(market.condition_id)
+                break  # One signal per market (best side wins)
 
         logger.info(f"[GRINDER] Scanned {scanned} books | "
                      f"Filtered: prob={filtered_prob} liq={filtered_liquidity} "

@@ -69,9 +69,53 @@ EXCHANGES = {
 }
 
 # ============================================================
+# EVENT CATEGORIES
+# ============================================================
+# Broad categories for market discovery. The grinder and bilateral
+# arb strategies use these to search beyond crypto price markets.
+
+EVENT_CATEGORIES = {
+    "politics": {
+        "queries": ["trump", "democrat", "republican", "president", "congress",
+                     "senate", "governor", "election", "vote"],
+        "label": "POL",
+    },
+    "sports": {
+        "queries": ["nba", "nfl", "mlb", "nhl", "ufc", "soccer",
+                     "finals", "championship", "super bowl", "world series"],
+        "label": "SPORT",
+    },
+    "economics": {
+        "queries": ["fed", "inflation", "gdp", "interest rate", "tariff",
+                     "recession", "unemployment", "cpi", "revenue", "budget",
+                     "deficit", "treasury"],
+        "label": "ECON",
+    },
+    "tech": {
+        "queries": ["ai", "openai", "google", "apple", "meta", "nvidia",
+                     "tesla", "spacex", "tiktok"],
+        "label": "TECH",
+    },
+    "world": {
+        "queries": ["ukraine", "russia", "china", "israel", "gaza", "war",
+                     "nato", "ceasefire"],
+        "label": "WORLD",
+    },
+    "culture": {
+        "queries": ["elon", "oscar", "grammy", "netflix", "gta", "viral"],
+        "label": "POP",
+    },
+    "crypto": {
+        "queries": ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto"],
+        "label": "CRYPTO",
+    },
+}
+
+# ============================================================
 # TRACKED ASSETS
 # ============================================================
 # Map of assets to their exchange symbols and Polymarket search terms.
+# Used by spot_divergence strategy for crypto price plays.
 
 ASSETS = {
     "BTC": {
@@ -199,15 +243,15 @@ EXECUTION = {
 # ============================================================
 # STRATEGY: HIGH PROBABILITY GRINDER
 # ============================================================
-# Buy YES tokens on events priced >90% at scale.
-# Profit per win is small (5-10c) but win rate is very high.
+# Buy high-probability tokens (YES or NO) at scale.
+# Profit per win is small (5-15c) but win rate is very high.
 
 HIGH_PROB_GRINDER = {
-    # Only buy YES tokens priced in this range
-    "min_probability": 0.90,
+    # Buy tokens priced in this range (checks both YES and NO sides)
+    "min_probability": 0.85,
     "max_probability": 0.97,
     # Sweet spot: best risk/reward zone
-    "sweet_spot_low": 0.91,
+    "sweet_spot_low": 0.88,
     "sweet_spot_high": 0.95,
     # Market quality filters
     "min_liquidity": 5_000,
@@ -221,9 +265,11 @@ HIGH_PROB_GRINDER = {
     "max_exposure_usdc": 2_000.0,
     # Time-to-expiry window
     "min_hours_to_expiry": 2,
-    "max_days_to_expiry": 30,
-    # Number of markets to scan per cycle
+    "max_days_to_expiry": 365,  # Allow long-dated markets (politics, sports seasons)
+    # Number of markets to scan per cycle (per query)
     "scan_limit": 200,
+    # Run category-specific searches alongside the broad scan
+    "category_scan": True,
     # Minimum positive EV per share
     "min_edge": 0.01,
 }

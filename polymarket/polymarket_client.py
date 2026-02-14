@@ -311,6 +311,38 @@ class PolymarketClient:
 
         return price_markets
 
+    def search_all_categories(self, limit_per_query: int = 100) -> list[Market]:
+        """
+        Search across all event categories for broad market coverage.
+
+        Runs the default broad query plus targeted queries from
+        EVENT_CATEGORIES, deduplicating results.
+        """
+        from .config import EVENT_CATEGORIES
+
+        seen: set[str] = set()
+        all_markets: list[Market] = []
+
+        def _add(markets: list[Market]):
+            for m in markets:
+                if m.condition_id not in seen:
+                    seen.add(m.condition_id)
+                    all_markets.append(m)
+
+        # Broad scan first (gets whatever Gamma returns by default)
+        _add(self.search_markets("", limit=200, active_only=True))
+
+        # Category-specific queries to find markets the broad scan misses
+        for cat_name, cat_cfg in EVENT_CATEGORIES.items():
+            for query in cat_cfg["queries"]:
+                results = self.search_markets(query, limit=limit_per_query,
+                                              active_only=True)
+                _add(results)
+
+        logger.info(f"Category scan: {len(all_markets)} unique markets "
+                     f"across {len(EVENT_CATEGORIES)} categories")
+        return all_markets
+
     # --------------------------------------------------------
     # Order Book (CLOB API — public for reads)
     # --------------------------------------------------------

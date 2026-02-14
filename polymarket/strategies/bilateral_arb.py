@@ -42,11 +42,12 @@ Fees:
 """
 
 import logging
+import re
 import time
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
-from ..config import ASSETS, BILATERAL_ARB
+from ..config import ASSETS, BILATERAL_ARB, EVENT_CATEGORIES
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
@@ -136,19 +137,10 @@ class BilateralArb(BaseStrategy):
         return all_signals
 
     def _fetch_markets(self, assets: Optional[list[str]]) -> list[Market]:
-        """Fetch markets to scan."""
-        if assets:
-            all_markets = []
-            for asset in assets:
-                markets = self.client.find_crypto_price_markets(asset)
-                all_markets.extend(markets)
-            # Also do a broad search for more coverage
-            broad = self.client.search_markets("", limit=self.cfg["scan_limit"],
-                                                active_only=True)
-            all_markets.extend(broad)
-        else:
-            all_markets = self.client.search_markets("", limit=self.cfg["scan_limit"],
-                                                      active_only=True)
+        """Fetch markets to scan across all event categories."""
+        # Always use full category scan for maximum coverage
+        all_markets = self.client.search_all_categories(
+            limit_per_query=self.cfg["scan_limit"])
 
         # Deduplicate
         seen = set()
@@ -534,10 +526,16 @@ class BilateralArb(BaseStrategy):
     # --------------------------------------------------------
 
     def _guess_asset(self, question: str) -> str:
-        """Best-effort asset tagging from market question text."""
+        """Best-effort category tagging from market question text."""
         q = question.lower()
+        # Try crypto assets first (word-boundary match)
         for asset, cfg in ASSETS.items():
             tags = cfg.get("polymarket_tags", [])
-            if any(t in q for t in tags):
+            if any(re.search(rf'\b{re.escape(t)}\b', q) for t in tags):
                 return asset
+        # Then event categories
+        for cat_name, cat_cfg in EVENT_CATEGORIES.items():
+            for query in cat_cfg["queries"]:
+                if query in q:
+                    return cat_cfg["label"]
         return "MISC"
