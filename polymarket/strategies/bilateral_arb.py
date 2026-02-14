@@ -65,6 +65,7 @@ _DEFAULTS = {
     "size_per_leg_usdc": 50.0,
     "max_exposure_usdc": 2_000.0,
     "scan_limit": 200,
+    "scan_timeout_seconds": 45,  # Max time budget per scan type
     "max_expiry_gap_hours": 24,
     "complement_keywords": {
         "above": "below",
@@ -174,8 +175,13 @@ class BilateralArb(BaseStrategy):
         """
         signals = []
         checked = 0
+        deadline = time.time() + self.cfg["scan_timeout_seconds"]
 
         for market in markets:
+            if time.time() > deadline:
+                logger.info(f"[BILATERAL] Intra-market scan hit time budget after {checked} checks")
+                break
+
             if not market.yes_token_id or not market.no_token_id:
                 continue
 
@@ -297,8 +303,12 @@ class BilateralArb(BaseStrategy):
 
         # Build index: (asset_tag, target_price, direction) → market
         market_index: dict[tuple[str, float, str], list[tuple[Market, OrderBook]]] = {}
+        deadline = time.time() + self.cfg["scan_timeout_seconds"]
 
         for market in markets:
+            if time.time() > deadline:
+                logger.info("[BILATERAL] Cross-market indexing hit time budget")
+                break
             if not market.yes_token_id:
                 continue
 
@@ -420,7 +430,13 @@ class BilateralArb(BaseStrategy):
         """
         signals = []
 
+        deadline = time.time() + self.cfg["scan_timeout_seconds"]
+
         for market in markets:
+            if time.time() > deadline:
+                logger.info("[BILATERAL] Multi-outcome scan hit time budget")
+                break
+
             # Multi-outcome markets have 3+ outcomes
             if len(market.outcomes) < 3 or len(market.token_ids) < 3:
                 continue
