@@ -405,6 +405,17 @@ class ExecutionEngine:
                 if book:
                     current_price = book.midpoint
                 else:
+                    # Both midpoint and orderbook unavailable — market has
+                    # likely expired/resolved and the CLOB removed the book.
+                    # Auto-close at last known price to free up capacity.
+                    exit_price = pos.current_price if pos.current_price > 0 else pos.entry_price
+                    logger.info(
+                        f"Market gone (no orderbook) for {pos.position_id} "
+                        f"({pos.market_question[:50]}) — auto-closing at "
+                        f"${exit_price:.3f}"
+                    )
+                    self._close_position(pos, exit_price, "market_expired")
+                    closed.append(pos)
                     continue
 
             pos.current_price = current_price

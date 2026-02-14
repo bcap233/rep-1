@@ -55,14 +55,36 @@ class CompositePrice:
     timestamp: float = 0.0
 
 
+_CIRCUIT_BREAKER_DURATION = 300  # seconds to block a domain after 451
+_blocked_domains: dict[str, float] = {}  # netloc → blocked_until
+
+
 def _http_get(url: str, timeout: int = 10) -> Optional[dict | list]:
-    """Simple HTTP GET returning parsed JSON."""
+    """Simple HTTP GET returning parsed JSON.
+
+    Includes a circuit breaker: if a domain returns HTTP 451 (geo-blocked),
+    all subsequent requests to that domain are skipped for 5 minutes to
+    avoid wasting time on requests that will always fail.
+    """
+    from urllib.parse import urlparse
+    netloc = urlparse(url).netloc
+
+    # Circuit breaker: skip domains that recently returned 451
+    blocked_until = _blocked_domains.get(netloc, 0)
+    if time.time() < blocked_until:
+        return None
+
     req = urllib.request.Request(url, headers={"User-Agent": "polymarket-arb-bot/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        logger.warning(f"HTTP {e.code} from {url}")
+        if e.code == 451:
+            _blocked_domains[netloc] = time.time() + _CIRCUIT_BREAKER_DURATION
+            logger.warning(f"HTTP 451 from {netloc} — circuit breaker tripped for "
+                           f"{_CIRCUIT_BREAKER_DURATION}s")
+        else:
+            logger.warning(f"HTTP {e.code} from {url}")
         return None
     except Exception as e:
         logger.warning(f"Request failed for {url}: {e}")
