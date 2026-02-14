@@ -185,15 +185,18 @@ class HighProbGrinder(BaseStrategy):
                 filtered_liquidity += 1
                 continue
 
-            # Check time to expiry
+            # Check time to expiry — require a known end date
             hours = _hours_to_expiry(market.end_date)
-            if hours is not None:
-                if hours < self.cfg["min_hours_to_expiry"]:
-                    filtered_expiry += 1
-                    continue
-                if hours > self.cfg["max_days_to_expiry"] * 24:
-                    filtered_expiry += 1
-                    continue
+            if hours is None:
+                # No end date → likely long-dated, skip it
+                filtered_expiry += 1
+                continue
+            if hours < self.cfg["min_hours_to_expiry"]:
+                filtered_expiry += 1
+                continue
+            if hours > self.cfg["max_days_to_expiry"] * 24:
+                filtered_expiry += 1
+                continue
 
             # Check both YES and NO tokens for high-probability side
             candidates = []

@@ -289,9 +289,9 @@ HIGH_PROB_GRINDER = {
     # Strategy-level position limits
     "max_positions": 50,
     "max_exposure_usdc": 2_000.0,
-    # Time-to-expiry window
-    "min_hours_to_expiry": 0,  # Allow markets about to resolve
-    "max_days_to_expiry": 365,  # Allow long-dated markets (politics, sports seasons)
+    # Time-to-expiry window — keep capital turning over fast
+    "min_hours_to_expiry": 1,  # Skip markets resolving in < 1 hour (price already locked)
+    "max_days_to_expiry": 7,  # Only short-dated markets (resolves within a week)
     # Number of markets to scan per cycle (per query)
     "scan_limit": 200,
     # Run category-specific searches alongside the broad scan
