@@ -29,58 +29,45 @@ from .signals import Signal
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------
-# Paper-mode slippage simulation
+# Paper-mode slippage: walk the real order book
 # --------------------------------------------------------
-# Real Polymarket CLOB books are thin, especially on short-duration
-# BTC Up/Down markets.  Paper mode previously assumed instant fills
-# at best-ask, which overstated returns by ~$5-10k per 400 trades.
-# This model adds realistic slippage based on order size and price tier.
-
-# Maximum shares per order for penny-priced contracts.
-# Real books have 50-200 shares at 1-2c; buying 10,000 is impossible.
-_PAPER_MAX_SHARES_PENNY = 250      # contracts priced <= 5c
-_PAPER_MAX_SHARES_CHEAP = 500      # contracts priced 5-20c
-_PAPER_MAX_SHARES_DEFAULT = 1_000  # everything else
+# Instead of guessing slippage, we fetch the actual CLOB order book
+# and simulate filling the order through real price levels.
 
 
-def _estimate_paper_slippage(price: float, size: int) -> float:
-    """Return estimated slippage in probability points for a paper trade.
+def _walk_book(levels: list[tuple[float, float]], size: int) -> tuple[float, int]:
+    """Walk through order book levels to compute average fill price.
 
-    Model assumptions (conservative, based on typical BTC Up/Down books):
-      - Penny (<=5c):  10c base + 0.5c per 50 extra shares
-      - Cheap (5-20c): 3c base  + 0.3c per 100 extra shares
-      - Mid (20-80c):  1.5c base + 0.2c per 100 extra shares
-      - Expensive (>80c): 0.5c base + 0.1c per 100 extra shares
+    Args:
+        levels: [(price, size), ...] sorted best-first
+                (ascending for asks, descending for bids)
+        size: number of shares to fill
+
+    Returns:
+        (avg_fill_price, fillable_size)
+        If the book can't fill the full order, fillable_size < size.
     """
-    if price <= 0.05:
-        base = 0.04
-        per_unit = 0.005 / 50  # 0.5c per 50 shares
-        depth_at_best = 100
-    elif price <= 0.20:
-        base = 0.025
-        per_unit = 0.003 / 100
-        depth_at_best = 200
-    elif price <= 0.80:
-        base = 0.015
-        per_unit = 0.002 / 100
-        depth_at_best = 300
-    else:
-        base = 0.005
-        per_unit = 0.001 / 100
-        depth_at_best = 400
+    remaining = size
+    total_cost = 0.0
+    filled = 0
 
-    excess = max(0, size - depth_at_best)
-    slippage = base + excess * per_unit
-    return round(min(slippage, 0.20), 4)   # cap at 20c
+    for level_price, level_size in levels:
+        if remaining <= 0:
+            break
+        take = min(remaining, int(level_size))
+        total_cost += take * level_price
+        filled += take
+        remaining -= take
+
+    if filled == 0:
+        return 0.0, 0
+
+    return total_cost / filled, filled
 
 
-def _cap_paper_size(price: float, size: int) -> int:
-    """Cap order size for paper trades to match realistic book depth."""
-    if price <= 0.05:
-        return min(size, _PAPER_MAX_SHARES_PENNY)
-    if price <= 0.20:
-        return min(size, _PAPER_MAX_SHARES_CHEAP)
-    return min(size, _PAPER_MAX_SHARES_DEFAULT)
+def _cap_to_book_depth(levels: list[tuple[float, float]]) -> int:
+    """Return total depth available across all book levels."""
+    return int(sum(sz for _, sz in levels))
 
 
 @dataclass
@@ -440,15 +427,32 @@ class ExecutionEngine:
             else:
                 price = min(0.99, price + offset)
 
-        # --- Paper-mode slippage simulation ---
+        # --- Paper-mode: walk the real order book for realistic fills ---
+        slip_info = ""
         if mode == "paper":
-            size = _cap_paper_size(price, size)
-            slip = _estimate_paper_slippage(price, size)
-            if signal.side == "BUY":
-                price = min(0.99, price + slip)
+            book = self.client.get_order_book(signal.token_id)
+            if book:
+                levels = book.asks if signal.side == "BUY" else book.bids
+                total_depth = _cap_to_book_depth(levels)
+
+                # Can't buy more than the book has
+                size = min(size, max(1, total_depth))
+
+                avg_fill, filled = _walk_book(levels, size)
+                if filled > 0 and avg_fill > 0:
+                    slip = abs(avg_fill - price)
+                    price = round(avg_fill, 4)
+                    size = filled
+                    slip_info = (f"slippage={slip:.3f}, "
+                                 f"book_depth={total_depth}, "
+                                 f"levels={len(levels)}")
+                else:
+                    logger.warning(f"[PAPER] Book empty for {signal.token_side} "
+                                   f"| {signal.market.question[:40]} — skipping")
+                    return None
             else:
-                price = max(0.01, price - slip)
-            price = round(price, 4)
+                logger.warning(f"[PAPER] No book for {signal.token_id[:20]}... — skipping")
+                return None
 
         cost = price * size
 
@@ -472,7 +476,7 @@ class ExecutionEngine:
             logger.info(f"Order placed: {order_id}")
         else:
             order_id = f"paper_{int(time.time())}"
-            logger.info(f"Paper trade logged (slippage={slip:.3f}): {order_id}")
+            logger.info(f"Paper trade logged ({slip_info}): {order_id}")
 
         # Create position
         now = time.time()
@@ -525,10 +529,17 @@ class ExecutionEngine:
         legs = signal.arb_legs
         size = signal.suggested_size
 
-        # Cap size for paper mode based on cheapest leg price
+        # Paper mode: cap size to smallest book depth across all legs
         if mode == "paper":
-            min_leg_price = min(leg["price"] for leg in legs)
-            size = _cap_paper_size(min_leg_price, size)
+            for leg in legs:
+                book = self.client.get_order_book(leg["token_id"])
+                if book and book.asks:
+                    leg_depth = _cap_to_book_depth(book.asks)
+                    size = min(size, max(1, leg_depth))
+                    leg["_book"] = book  # stash for per-leg fill calc
+                else:
+                    logger.warning(f"[PAPER] No book for bilateral leg — skipping arb")
+                    return None
 
         total_cost = sum(leg["price"] * size for leg in legs)
         guaranteed_payout = size  # One leg resolves to $1.00 * size
@@ -550,11 +561,14 @@ class ExecutionEngine:
             logger.info(f"  Leg {i+1}/{len(legs)}: BUY {size} {leg_label} "
                          f"@ ${leg_price:.2f}")
 
-            # Paper slippage per leg
+            # Paper mode: walk real book for this leg
             if mode == "paper":
-                slip = _estimate_paper_slippage(leg_price, size)
-                leg_price = min(0.99, leg_price + slip)
-                leg_price = round(leg_price, 4)
+                leg_book = leg.get("_book")
+                if leg_book and leg_book.asks:
+                    avg_fill, filled = _walk_book(leg_book.asks, size)
+                    if filled > 0:
+                        leg_price = round(avg_fill, 4)
+                        size = min(size, filled)
 
             if mode == "live":
                 order = self.client.place_order(
@@ -736,16 +750,19 @@ class ExecutionEngine:
 
         mode = EXECUTION["mode"]
 
-        # Apply exit slippage in paper mode (selling into the bid)
+        # Paper mode: walk real book for exit fill price
         if mode == "paper":
-            slip = _estimate_paper_slippage(exit_price, int(pos.entry_size))
-            if pos.side == "BUY":
-                # Selling: slippage works against us (lower fill)
-                exit_price = max(0.005, exit_price - slip)
-            else:
-                # Buying back: slippage works against us (higher fill)
-                exit_price = min(0.995, exit_price + slip)
-            exit_price = round(exit_price, 4)
+            book = self.client.get_order_book(pos.token_id)
+            if book:
+                # Selling = hitting bids; buying back = hitting asks
+                if pos.side == "BUY":
+                    levels = book.bids
+                else:
+                    levels = book.asks
+                if levels:
+                    avg_fill, filled = _walk_book(levels, int(pos.entry_size))
+                    if filled > 0:
+                        exit_price = round(avg_fill, 4)
 
         if pos.side == "BUY":
             pos.realized_pnl = (exit_price - pos.entry_price) * pos.entry_size
