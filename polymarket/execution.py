@@ -170,6 +170,7 @@ class ExecutionState:
     total_exposure: float = 0.0
     cooldowns: dict = field(default_factory=dict)  # condition_id → cooldown_until
     last_update: float = 0.0
+    daily_pnl_date: str = ""  # YYYY-MM-DD — tracks which day daily_pnl belongs to
 
 
 def _calc_stop(signal, price: float) -> float:
@@ -328,15 +329,78 @@ class ExecutionEngine:
                     self.state.positions.append(Position(**p))
                 self.state.daily_pnl = data.get("daily_pnl", 0)
                 self.state.daily_trades = data.get("daily_trades", 0)
+                self.state.daily_pnl_date = data.get("daily_pnl_date", "")
                 self.state.cooldowns = data.get("cooldowns", {})
                 logger.info(f"Loaded {len(self.state.positions)} open positions from state")
             except Exception as e:
                 logger.warning(f"Could not load state: {e}")
 
+        # Reset daily counters if the date has changed (midnight rollover).
+        # Also reconcile with trade log on load to fix any drift.
+        self._check_daily_reset()
+        self._reconcile_daily_from_trade_log()
+
+    def _check_daily_reset(self):
+        """Reset daily counters if the calendar date (UTC) has changed."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.state.daily_pnl_date and self.state.daily_pnl_date != today:
+            logger.info(f"[DAILY RESET] New day {today} (was {self.state.daily_pnl_date}). "
+                        f"Resetting daily_pnl=${self.state.daily_pnl:+.2f}, "
+                        f"daily_trades={self.state.daily_trades}")
+            self.state.daily_pnl = 0.0
+            self.state.daily_trades = 0
+        self.state.daily_pnl_date = today
+
+    def _reconcile_daily_from_trade_log(self):
+        """Recompute today's daily_pnl from the trade log (source of truth).
+
+        Fixes drift caused by state resets, crashes, or missed updates.
+        Only called on startup — not every save cycle.
+        """
+        path = Path(DATA["trade_log"])
+        if not path.exists():
+            return
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_pnl = 0.0
+        today_trades = 0
+
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if entry.get("action") != "CLOSE":
+                        continue
+                    ts = entry.get("timestamp", 0)
+                    trade_date = datetime.fromtimestamp(
+                        ts, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                    if trade_date == today:
+                        today_pnl += entry.get("pnl", 0)
+                        today_trades += 1
+        except Exception as e:
+            logger.warning(f"[RECONCILE] Could not read trade log: {e}")
+            return
+
+        if abs(today_pnl - self.state.daily_pnl) > 1.0:
+            logger.info(f"[RECONCILE] Fixing daily_pnl: "
+                        f"state=${self.state.daily_pnl:.2f} → "
+                        f"trade_log=${today_pnl:.2f} "
+                        f"(diff=${today_pnl - self.state.daily_pnl:+.2f})")
+        self.state.daily_pnl = today_pnl
+        self.state.daily_trades = today_trades
+        self.state.daily_pnl_date = today
+
     def _save_state(self):
         """Persist state to disk atomically (write to temp, then rename)."""
         path = Path(DATA["state_file"])
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check for midnight rollover on every save
+        self._check_daily_reset()
 
         # Garbage-collect expired cooldowns
         now = time.time()
@@ -348,6 +412,7 @@ class ExecutionEngine:
             "positions": [vars(p) for p in self.state.positions],
             "daily_pnl": self.state.daily_pnl,
             "daily_trades": self.state.daily_trades,
+            "daily_pnl_date": self.state.daily_pnl_date,
             "cooldowns": self.state.cooldowns,
             "last_update": now,
         }

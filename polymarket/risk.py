@@ -68,6 +68,7 @@ class BankrollManager:
         self.cumulative_pnl = 0.0
         self.trade_history: list[float] = []  # list of realized PnLs
         self._load()
+        self._reconcile_from_trade_log()
 
     # ---- Persistence ----
 
@@ -89,6 +90,42 @@ class BankrollManager:
                             f"{len(self.trade_history)} trades in window)")
             except Exception as e:
                 logger.warning(f"[KELLY] Could not load bankroll: {e}")
+
+    def _reconcile_from_trade_log(self):
+        """Reconcile cumulative_pnl with the trade log (source of truth).
+
+        The trade log records every close independently. If there's a gap
+        (e.g., bankroll tracking started late, or a crash lost updates),
+        this corrects cumulative_pnl and bankroll on startup.
+        """
+        from .config import DATA
+        trade_log_path = Path(DATA["trade_log"])
+        if not trade_log_path.exists():
+            return
+
+        try:
+            log_total = 0.0
+            with open(trade_log_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if entry.get("action") == "CLOSE":
+                        log_total += entry.get("pnl", 0)
+        except Exception as e:
+            logger.warning(f"[KELLY] Could not reconcile from trade log: {e}")
+            return
+
+        gap = log_total - self.cumulative_pnl
+        if abs(gap) > 1.0:
+            logger.info(f"[KELLY] Reconciling bankroll: trade_log=${log_total:+.2f} "
+                        f"vs cumulative=${self.cumulative_pnl:+.2f} (gap=${gap:+.2f})")
+            self.cumulative_pnl = log_total
+            self.bankroll = self.initial_bankroll + log_total
+            if self.bankroll > self.peak_bankroll:
+                self.peak_bankroll = self.bankroll
+            self.save()
 
     def save(self):
         path = Path(KELLY["bankroll_file"])
