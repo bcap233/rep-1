@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
-from ..config import ASSETS, HIGH_PROB_GRINDER, EVENT_CATEGORIES
+from ..config import ASSETS, HIGH_PROB_GRINDER, EVENT_CATEGORIES, MARKET_MAKER
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
@@ -137,13 +137,22 @@ class HighProbGrinder(BaseStrategy):
         """
         Scan all active markets for high-probability opportunities.
 
-        This strategy ignores the `assets` parameter — it scans everything.
+        Two market sources:
+        1. Gamma API (event markets): politics, sports, economics, etc.
+        2. BTC Up/Down 5m/15m markets: when momentum pushes one side to 90%+
+
         The grinder doesn't care what the market is about, only that
         the probability is high, the market is liquid, and the math works.
         """
         logger.info(f"[GRINDER] Scanning for >{self.cfg['min_probability']*100:.0f}% events...")
 
-        # Fetch markets: broad scan + category-specific searches
+        signals = []
+
+        # Source 1: BTC/ETH Up/Down short-duration markets
+        updown_signals = self._scan_updown_markets()
+        signals.extend(updown_signals)
+
+        # Source 2: Gamma API broad market scan
         if self.cfg.get("category_scan", True):
             all_markets = self.client.search_all_categories(
                 limit_per_query=self.cfg["scan_limit"])
@@ -152,10 +161,13 @@ class HighProbGrinder(BaseStrategy):
                 "", limit=self.cfg["scan_limit"], active_only=True)
 
         if not all_markets:
-            logger.warning("[GRINDER] No markets returned from search")
+            logger.warning("[GRINDER] No event markets returned from search")
+            if signals:
+                signals.sort(key=lambda s: s.edge, reverse=True)
+                return signals
             return []
 
-        logger.info(f"[GRINDER] Fetched {len(all_markets)} active markets, filtering...")
+        logger.info(f"[GRINDER] Fetched {len(all_markets)} event markets, filtering...")
 
         signals = []
         scanned = 0
@@ -305,6 +317,127 @@ class HighProbGrinder(BaseStrategy):
 
         # Sort by EV per share (best first)
         signals.sort(key=lambda s: s.edge, reverse=True)
+        return signals
+
+    def _scan_updown_markets(self) -> list[Signal]:
+        """Scan BTC Up/Down 5m/15m markets for high-probability setups.
+
+        When BTC has clear momentum, one side of these markets sits at
+        90%+. Buy that side and hold to resolution (5-15 minutes) to
+        collect $1.00. Fast capital turnover = law of large numbers.
+        """
+        from .market_maker import _parse_market_duration, _minutes_to_market_end
+
+        signals = []
+        durations = MARKET_MAKER.get("durations", ["5m", "15m"])
+        min_minutes = MARKET_MAKER.get("min_minutes_to_expiry", 2)
+
+        markets = self.client.find_btc_updown_markets(durations)
+        if not markets:
+            return []
+
+        scanned = 0
+        for market in markets:
+            if market.condition_id in self._seen_conditions:
+                continue
+
+            q = market.question
+            duration = _parse_market_duration(q)
+            if duration not in durations:
+                continue
+
+            mins_left = _minutes_to_market_end(q)
+            if mins_left is None or mins_left < min_minutes:
+                continue
+
+            if len(market.token_ids) < 2:
+                continue
+
+            # Check both Up (index 0) and Down (index 1) tokens
+            sides = [
+                (market.token_ids[0], "Up"),
+                (market.token_ids[1], "Down"),
+            ]
+
+            for token_id, token_side in sides:
+                book = self.client.get_order_book(token_id)
+                if not book or not book.asks:
+                    continue
+
+                scanned += 1
+                mid = book.midpoint
+
+                if mid < self.cfg["min_probability"] or mid > self.cfg["max_probability"]:
+                    continue
+
+                if book.spread > self.cfg["max_spread"]:
+                    continue
+
+                ask_depth = sum(size for _, size in book.asks[:3])
+                if ask_depth < self.cfg["min_ask_depth"]:
+                    continue
+
+                entry_price = book.best_ask
+                if entry_price > self.cfg["max_probability"]:
+                    continue
+
+                profit_per_share = 1.0 - entry_price
+                loss_per_share = entry_price
+                implied_prob = entry_price
+                # Up/Down markets with strong momentum: true prob slightly
+                # higher than implied when one side is at 90%+
+                estimated_true_prob = min(0.99, implied_prob + 0.02)
+
+                ev_per_share = (estimated_true_prob * profit_per_share -
+                                (1 - estimated_true_prob) * loss_per_share)
+
+                if ev_per_share < self.cfg["min_edge"] * profit_per_share:
+                    continue
+
+                size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
+
+                # Confidence: higher in sweet spot, boost for short duration
+                if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
+                    confidence = 0.85
+                else:
+                    confidence = 0.65
+
+                # Short-duration markets resolve fast = less uncertainty
+                if duration == "5m":
+                    confidence = min(1.0, confidence + 0.05)
+
+                signal = Signal(
+                    asset="BTC",
+                    market=market,
+                    token_id=token_id,
+                    side="BUY",
+                    token_side=token_side,
+                    spot_price=0.0,
+                    target_price=0.0,
+                    implied_prob=implied_prob,
+                    fair_prob=estimated_true_prob,
+                    edge=ev_per_share,
+                    confidence=confidence,
+                    momentum_score=0.0,
+                    momentum_direction="n/a",
+                    confirming_timeframes=0,
+                    suggested_price=round(entry_price, 2),
+                    suggested_size=size,
+                    timestamp=time.time(),
+                    reason=(
+                        f"GRINDER-UPDOWN: {token_side}@{entry_price:.2f} "
+                        f"({duration}, {mins_left:.0f}m left) | "
+                        f"EV={ev_per_share:+.4f}/share | "
+                        f"spread={book.spread:.3f} depth={ask_depth:.0f}"
+                    ),
+                    strategy="high_prob_grinder",
+                )
+                signals.append(signal)
+                self._seen_conditions.add(market.condition_id)
+                break  # One signal per market (best side wins)
+
+        logger.info(f"[GRINDER] Up/Down scan: {scanned} books checked, "
+                     f"{len(signals)} high-prob setups found")
         return signals
 
     def reset_seen(self):
