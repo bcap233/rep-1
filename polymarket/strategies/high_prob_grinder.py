@@ -96,6 +96,12 @@ _DEFAULTS = {
     # 5m/15m markets have momentum persistence and fast resolution.
     "updown_min_probability": 0.78,
     "updown_min_ask_depth": 30,
+    # Momentum entry: if the midpoint moves this much over recent
+    # scans, enter at a LOWER threshold. Books are thin and move fast;
+    # catching a trend early beats waiting for 78%.
+    "momentum_min_probability": 0.62,  # Enter trending side at 62%+
+    "momentum_min_delta": 0.05,        # Need 5%+ midpoint shift
+    "momentum_min_scans": 2,           # Over at least 2 scans
 }
 
 
@@ -152,6 +158,12 @@ class HighProbGrinder(BaseStrategy):
         # Gamma only every 5 min.
         self._last_gamma_scan: float = 0.0
         self._gamma_interval: float = 300.0  # 5 minutes
+        # Scan-to-scan midpoint history for Up/Down markets.
+        # condition_id → list of (timestamp, up_mid) — last N scans.
+        # Used to detect momentum: if the mid moves 5%+ in one
+        # direction over 2-3 scans, enter even at lower thresholds.
+        self._mid_history: dict[str, list[tuple[float, float]]] = {}
+        self._mid_history_max = 6  # Keep last ~60s of scans
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
         """
@@ -400,7 +412,27 @@ class HighProbGrinder(BaseStrategy):
 
             up_ask = up_book.best_ask
             down_ask = down_book.best_ask
+            up_mid = up_book.midpoint
             cond = market.condition_id
+
+            # Record midpoint for momentum tracking
+            now_ts = time.time()
+            if cond not in self._mid_history:
+                self._mid_history[cond] = []
+            self._mid_history[cond].append((now_ts, up_mid))
+            # Trim old entries
+            self._mid_history[cond] = self._mid_history[cond][-self._mid_history_max:]
+
+            # Compute scan-to-scan momentum (delta from oldest to newest)
+            history = self._mid_history[cond]
+            mid_delta = 0.0
+            mid_direction = "flat"
+            if len(history) >= self.cfg["momentum_min_scans"]:
+                mid_delta = history[-1][1] - history[0][1]
+                if mid_delta > 0.01:
+                    mid_direction = "up"
+                elif mid_delta < -0.01:
+                    mid_direction = "down"
 
             # --- MODE 1: IMMEDIATE LOCK ---
             # Both sides available now, total < threshold → riskless profit.
@@ -483,24 +515,52 @@ class HighProbGrinder(BaseStrategy):
                             continue
 
             # --- MODE 3: DIRECTIONAL ENTRY ---
-            # One side at 78%+ (lower than event markets because these
-            # are short-duration with momentum persistence). Buy it,
-            # track the leg for potential lock on next cycle.
+            # Two thresholds:
+            #   Static: 78%+ (works without momentum data)
+            #   Momentum: 62%+ if midpoint is trending 5%+ over recent scans
+            #
+            # Books are thin and move fast. Catching a trend at 65% and
+            # riding it to 85%+ (or locking) beats waiting for 78%.
             if cond in self._seen_conditions:
                 continue
 
-            min_prob = self.cfg["updown_min_probability"]
+            # Pick threshold based on momentum
+            has_momentum = abs(mid_delta) >= self.cfg["momentum_min_delta"]
+            if has_momentum:
+                min_prob = self.cfg["momentum_min_probability"]
+            else:
+                min_prob = self.cfg["updown_min_probability"]
             max_prob = self.cfg["max_probability"]
             min_depth = self.cfg["updown_min_ask_depth"]
 
-            sides = [
-                (up_token, "Up", up_book, down_token, "Down"),
-                (down_token, "Down", down_book, up_token, "Up"),
-            ]
+            # Order sides so momentum-confirmed side is checked first
+            if mid_direction == "down":
+                sides = [
+                    (down_token, "Down", down_book, up_token, "Up"),
+                    (up_token, "Up", up_book, down_token, "Down"),
+                ]
+            else:
+                sides = [
+                    (up_token, "Up", up_book, down_token, "Down"),
+                    (down_token, "Down", down_book, up_token, "Up"),
+                ]
 
             for token_id, token_side, book, other_tok, other_side in sides:
                 mid = book.midpoint
-                if mid < min_prob or mid > max_prob:
+
+                # Check if this side has momentum confirmation
+                side_has_momentum = (
+                    has_momentum and
+                    ((token_side == "Up" and mid_direction == "up") or
+                     (token_side == "Down" and mid_direction == "down"))
+                )
+
+                # Use momentum threshold only for the confirmed side
+                effective_min = (self.cfg["momentum_min_probability"]
+                                 if side_has_momentum
+                                 else self.cfg["updown_min_probability"])
+
+                if mid < effective_min or mid > max_prob:
                     continue
                 if book.spread > self.cfg["max_spread"]:
                     continue
@@ -516,21 +576,19 @@ class HighProbGrinder(BaseStrategy):
                 profit_per_share = 1.0 - entry_price
                 implied_prob = entry_price
 
-                # Time-decay edge: as expiry approaches, the market
-                # price becomes more accurate. More time = more
-                # uncertainty = our edge above implied is smaller.
-                # Less time = price is nearly settled = if it's at
-                # 90%, true prob is closer to 95%+.
-                #
-                # Scale: 10+ min left → +1.5% edge
-                #        5 min left  → +2.5% edge
-                #        2 min left  → +4% edge (nearly settled)
+                # Time-decay + momentum edge:
+                # Base edge from time remaining (price accuracy)
                 if mins_left <= 2:
                     edge_boost = 0.04
                 elif mins_left <= 5:
                     edge_boost = 0.025
                 else:
                     edge_boost = 0.015
+
+                # Momentum adds edge — the trend is likely to continue
+                if side_has_momentum:
+                    edge_boost += min(0.03, abs(mid_delta))
+
                 estimated_true_prob = min(0.99, implied_prob + edge_boost)
 
                 ev_per_share = (estimated_true_prob * profit_per_share -
@@ -541,19 +599,25 @@ class HighProbGrinder(BaseStrategy):
 
                 size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
 
-                # Confidence: scaled by probability + time remaining.
-                # Higher prob + less time = more certain.
+                # Confidence: probability + time + momentum
                 if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
                     confidence = 0.85
                 elif entry_price >= 0.85:
                     confidence = 0.75
+                elif side_has_momentum:
+                    # Momentum-confirmed at lower prob: moderate confidence
+                    confidence = 0.65
                 else:
-                    confidence = 0.60
+                    confidence = 0.55
 
                 # Time boost: less time left = more certainty
                 if mins_left <= 3:
                     confidence = min(1.0, confidence + 0.10)
                 elif duration == "5m":
+                    confidence = min(1.0, confidence + 0.05)
+
+                # Momentum boost
+                if side_has_momentum:
                     confidence = min(1.0, confidence + 0.05)
 
                 signal = Signal(
@@ -578,7 +642,8 @@ class HighProbGrinder(BaseStrategy):
                         f"GRINDER-UPDOWN: {token_side}@{entry_price:.2f} "
                         f"({duration}, {mins_left:.0f}m left) | "
                         f"edge+{edge_boost:.1%} EV={ev_per_share:+.4f}/sh | "
-                        f"spread={book.spread:.3f} depth={ask_depth:.0f}"
+                        f"Δ={mid_delta:+.2f} "
+                        f"{'↑MOMENTUM' if side_has_momentum else ''}"
                     ),
                     strategy="high_prob_grinder",
                 )
@@ -657,14 +722,20 @@ class HighProbGrinder(BaseStrategy):
         )
 
     def _expire_stale_legs(self):
-        """Remove open legs older than 20 minutes (market has resolved)."""
+        """Remove open legs and stale history older than 20 minutes."""
         cutoff = time.time() - 20 * 60
         expired = [cid for cid, leg in self._open_legs.items()
                    if leg["time"] < cutoff]
         for cid in expired:
             del self._open_legs[cid]
+            self._mid_history.pop(cid, None)
         if expired:
             logger.debug(f"[GRINDER] Expired {len(expired)} stale legs")
+        # Also clean history for markets we no longer see
+        stale_hist = [cid for cid, hist in self._mid_history.items()
+                      if hist and hist[-1][0] < cutoff]
+        for cid in stale_hist:
+            del self._mid_history[cid]
 
     def reset_seen(self):
         """Clear the seen-conditions cache (e.g., new trading session)."""
