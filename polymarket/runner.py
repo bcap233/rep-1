@@ -276,6 +276,13 @@ _WATCH_ONLY_CONFIGS = {
 # Strategies whose signals feed into MM sizing instead of executing independently
 _FEED_INTO_MM = {"spot_divergence"}
 
+# Heavy strategies scan hundreds of markets via API — throttle them to avoid
+# hammering the API every 10-second cycle.  MM runs every cycle (needs
+# frequent updates for short-duration markets).
+_HEAVY_SCAN_INTERVAL = 300  # seconds (5 minutes)
+_last_heavy_scan: dict[str, float] = {}  # strategy_name → last scan time
+_HEAVY_STRATEGIES = {"high_prob_grinder", "bilateral_arb"}
+
 
 def _compute_mm_boost(scout_signals: list[Signal],
                       feed_signals: list[Signal]) -> tuple[float, dict[str, float]]:
@@ -360,14 +367,26 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
         return 0
 
     # Step 3: Collect signals — three buckets:
-    #   executable: strategies that trade directly (market_maker)
-    #   scout: watch-only intelligence (grinder, bilateral)
+    #   executable: strategies that trade directly (MM, grinder, bilateral)
+    #   scout: watch-only intelligence (when watch_only=True in config)
     #   feed: signals that boost MM sizing (spot_divergence)
     executable_signals = []
     scout_signals = []
     feed_signals = []
+    now = time.time()
+
     for strategy in strategies:
         try:
+            # Throttle heavy strategies (grinder, bilateral) — they scan
+            # hundreds of markets via API. Run every 5 min, not every 10s cycle.
+            if strategy.name in _HEAVY_STRATEGIES:
+                last_scan = _last_heavy_scan.get(strategy.name, 0)
+                if now - last_scan < _HEAVY_SCAN_INTERVAL:
+                    logger.debug(f"--- Skipping {strategy.name} (throttled, "
+                                 f"{int(now - last_scan)}s since last scan) ---")
+                    continue
+                _last_heavy_scan[strategy.name] = now
+
             logger.info(f"--- Running {strategy.name} ---")
             signals = strategy.scan(assets)
 
@@ -393,7 +412,7 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
                     logger.info(f"  {strategy.name}: 0 signals")
             else:
                 executable_signals.extend(signals)
-                logger.info(f"  {strategy.name}: {len(signals)} signals")
+                logger.info(f"  {strategy.name}: {len(signals)} executable signals")
         except Exception as e:
             logger.error(f"Strategy {strategy.name} error: {e}", exc_info=True)
 

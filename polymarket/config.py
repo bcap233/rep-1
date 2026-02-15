@@ -219,13 +219,12 @@ RISK = {
     "max_position_usdc": 250.0,
 
     # Max total exposure across all open positions.
-    # When running multiple strategies (grinder=2k, bilateral=2k, spot=500),
-    # set this high enough to accommodate them all.
-    "max_total_exposure_usdc": 5_000.0,
+    # Three active strategies: MM ($4.8k), grinder ($2k), bilateral ($2k).
+    "max_total_exposure_usdc": 8_000.0,
 
     # Max number of concurrent open positions.
-    # Grinder alone can hold 50, bilateral 20, so set to accommodate all.
-    "max_open_positions": 75,
+    # MM=50, grinder=50, bilateral=20, spot=a few → need room for all.
+    "max_open_positions": 120,
 
     # Stop loss: exit if contract moves against us by this much
     "stop_loss": 0.18,  # 18 cents — wider to survive short-duration swings
@@ -305,9 +304,8 @@ EXECUTION = {
 # Profit per win is small (5-15c) but win rate is very high.
 
 HIGH_PROB_GRINDER = {
-    # Watch-only mode: scan and log signals, but don't execute trades.
-    # Signal count/quality feeds into dynamic MM capital scaling.
-    "watch_only": True,
+    # ACTIVE: execute trades on high-probability markets
+    "watch_only": False,
     # Buy tokens priced in this range (checks both YES and NO sides)
     "min_probability": 0.85,
     "max_probability": 0.97,
@@ -324,9 +322,9 @@ HIGH_PROB_GRINDER = {
     # Strategy-level position limits
     "max_positions": 50,
     "max_exposure_usdc": 2_000.0,
-    # Time-to-expiry window — keep capital turning over fast
+    # Time-to-expiry window
     "min_hours_to_expiry": 1,  # Skip markets resolving in < 1 hour (price already locked)
-    "max_days_to_expiry": 7,  # Only short-dated markets (resolves within a week)
+    "max_days_to_expiry": 90,  # Most liquid markets run 30-90 days
     # Number of markets to scan per cycle (per query)
     "scan_limit": 200,
     # Run category-specific searches alongside the broad scan
@@ -342,9 +340,8 @@ HIGH_PROB_GRINDER = {
 # cost is less than $1.00, locking in risk-free profit.
 
 BILATERAL_ARB = {
-    # Watch-only mode: scan and log signals, but don't execute trades.
-    # Signal count/quality feeds into dynamic MM capital scaling.
-    "watch_only": True,
+    # ACTIVE: execute bilateral arb trades (risk-free when both legs fill)
+    "watch_only": False,
     # Minimum gap after fees to execute each arb type
     "min_gap_intra": 0.02,   # Same-market YES+NO arb
     "min_gap_cross": 0.03,   # Cross-market complementary arb

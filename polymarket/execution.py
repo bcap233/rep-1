@@ -179,6 +179,10 @@ def _calc_stop(signal, price: float) -> float:
         was getting stopped out then reversing. 8c survives the noise.
         With 15c TP this is still ~2:1 reward/risk.
     Spot divergence: 10c
+    High prob grinder: no stop (0.0) — hold to resolution.
+        The whole thesis is that 90%+ events resolve YES ~96% of the time.
+        Stopping out on noise defeats the strategy.
+    Bilateral arb: no stop (handled separately in _execute_bilateral).
     Other: config default (18c)
     """
     strategy = getattr(signal, "strategy", "")
@@ -186,6 +190,8 @@ def _calc_stop(signal, price: float) -> float:
         sl_dist = 0.08
     elif strategy == "spot_divergence":
         sl_dist = 0.10
+    elif strategy in ("high_prob_grinder", "bilateral_arb"):
+        return 0.0  # Hold to resolution — no stop loss
     else:
         sl_dist = RISK["stop_loss"]
 
@@ -204,9 +210,13 @@ def _calc_tp(signal, price: float) -> float:
     MM: 15c TP with 8c SL = ~2:1 reward/risk.
     With maker fills (no slippage on wins), we keep the full TP.
     Need only ~35% win rate to break even.
+    High prob grinder: no TP — hold to resolution for full $1.00 payout.
+    Bilateral arb: no TP — hold to resolution (guaranteed payout).
     """
-    is_mm = getattr(signal, "strategy", "") == "market_maker"
-    if is_mm:
+    strategy = getattr(signal, "strategy", "")
+    if strategy in ("high_prob_grinder", "bilateral_arb"):
+        return 0.0  # Hold to resolution
+    if strategy == "market_maker":
         tp_dist = 0.15
     else:
         tp_dist = RISK["take_profit"]
@@ -228,40 +238,55 @@ def _et_to_utc_offset_hours() -> int:
         return 5
 
 
-def _market_end_timestamp(question: str) -> Optional[float]:
-    """Parse the market close time from the question text.
+def _market_end_timestamp(question: str, end_date: str = "") -> Optional[float]:
+    """Parse the market close time.
+
+    Tries two methods:
+    1. BTC Up/Down question format: "February 14, 1:30PM-1:45PM ET" → timestamp for 1:45PM ET
+    2. Gamma API end_date (ISO format): "2026-02-20T00:00:00Z" → timestamp
 
     Returns Unix timestamp of the market end, or None if unparseable.
-    E.g. "Bitcoin Up or Down - February 14, 1:30PM-1:45PM ET" → timestamp for 1:45PM ET.
     """
+    # Method 1: parse from question text (BTC Up/Down markets)
     m = re.search(
         r'(\w+ \d+),?\s*\d{1,2}:\d{2}(?:am|pm)\s*-\s*(\d{1,2}):(\d{2})(am|pm)\s*et',
         question.lower(),
     )
-    if not m:
-        return None
+    if m:
+        date_str = m.group(1)  # "february 14"
+        h, mi, p = int(m.group(2)), int(m.group(3)), m.group(4)
 
-    date_str = m.group(1)  # "february 14"
-    h, mi, p = int(m.group(2)), int(m.group(3)), m.group(4)
+        if p == 'pm' and h != 12:
+            h += 12
+        if p == 'am' and h == 12:
+            h = 0
 
-    if p == 'pm' and h != 12:
-        h += 12
-    if p == 'am' and h == 12:
-        h = 0
+        now = datetime.now(timezone.utc)
+        try:
+            end_dt = datetime.strptime(
+                f"{date_str} {now.year} {h:02d}:{mi:02d}",
+                "%B %d %Y %H:%M",
+            ).replace(tzinfo=timezone.utc)
+            end_dt = end_dt + timedelta(hours=_et_to_utc_offset_hours())
+            ts = end_dt.timestamp()
+            if ts > time.time():
+                return ts
+        except ValueError:
+            pass
 
-    now = datetime.now(timezone.utc)
-    try:
-        end_dt = datetime.strptime(
-            f"{date_str} {now.year} {h:02d}:{mi:02d}",
-            "%B %d %Y %H:%M",
-        ).replace(tzinfo=timezone.utc)
-        # Adjust for ET → UTC (handles DST automatically)
-        end_dt = end_dt + timedelta(hours=_et_to_utc_offset_hours())
-    except ValueError:
-        return None
+    # Method 2: parse end_date from Gamma API (grinder, bilateral, etc.)
+    if end_date:
+        for fmt in ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                    "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"]:
+            try:
+                end_dt = datetime.strptime(end_date, fmt).replace(tzinfo=timezone.utc)
+                ts = end_dt.timestamp()
+                if ts > time.time():
+                    return ts
+            except ValueError:
+                continue
 
-    ts = end_dt.timestamp()
-    return ts if ts > time.time() else None
+    return None
 
 
 class ExecutionEngine:
@@ -575,7 +600,7 @@ class ExecutionEngine:
             current_price=price,
             stop_loss_price=_calc_stop(signal, price),
             take_profit_price=_calc_tp(signal, price),
-            max_hold_until=_market_end_timestamp(signal.market.question) or (now + RISK["max_hold_minutes"] * 60),
+            max_hold_until=_market_end_timestamp(signal.market.question, getattr(signal.market, "end_date", "")) or (now + RISK["max_hold_minutes"] * 60),
             strategy=getattr(signal, "strategy", ""),
         )
 
@@ -744,84 +769,90 @@ class ExecutionEngine:
             else:
                 pos.unrealized_pnl = (pos.entry_price - current_price) * pos.entry_size
 
-            # Bilateral arb positions (stop=0, hold=0) are held to resolution —
-            # skip all stop/TP/time checks for them.
-            is_hold_to_resolution = (
-                pos.stop_loss_price == 0.0
-                and pos.take_profit_price == 0.0
-                and pos.max_hold_until == 0
-            )
-            if is_hold_to_resolution:
+            # Hold-to-resolution strategies (grinder, bilateral arb) have
+            # stop=0 and tp=0. They resolve when the market closes.
+            # Skip stop/TP/trailing logic for them — only time-based exit applies.
+            has_stop = pos.stop_loss_price > 0
+            has_tp = pos.take_profit_price > 0
+
+            if not has_stop and not has_tp and pos.max_hold_until == 0:
+                # Bilateral arb: no stop, no TP, no hold time → pure hold-to-resolution
                 continue
 
             # Trailing stop: once in profit, move stop to breakeven.
-            # Threshold = half the stop distance for each strategy.
-            strategy = getattr(pos, "strategy", "")
-            if strategy == "market_maker":
-                trail_threshold = 0.08   # 8c stop → trail at 8c profit
-            elif strategy == "spot_divergence":
-                trail_threshold = 0.05   # 10c stop → trail at 5c
-            else:
-                trail_threshold = 0.08   # 18c stop → trail at 8c
+            # Only applies to strategies with active stops (MM, spot_div).
+            if has_stop:
+                strategy = getattr(pos, "strategy", "")
+                if strategy == "market_maker":
+                    trail_threshold = 0.08   # 8c stop → trail at 8c profit
+                elif strategy == "spot_divergence":
+                    trail_threshold = 0.05   # 10c stop → trail at 5c
+                else:
+                    trail_threshold = 0.08   # 18c stop → trail at 8c
 
-            if pos.side == "BUY":
-                profit = current_price - pos.entry_price
-                if profit >= trail_threshold:
-                    new_sl = pos.entry_price + 0.01
-                    if new_sl > pos.stop_loss_price:
-                        pos.stop_loss_price = new_sl
-            elif pos.side == "SELL":
-                profit = pos.entry_price - current_price
-                if profit >= trail_threshold:
-                    # For shorts, tighten stop DOWN toward entry (lower = tighter)
-                    new_sl = pos.entry_price - 0.01
-                    if new_sl < pos.stop_loss_price:
-                        pos.stop_loss_price = new_sl
+                if pos.side == "BUY":
+                    profit = current_price - pos.entry_price
+                    if profit >= trail_threshold:
+                        new_sl = pos.entry_price + 0.01
+                        if new_sl > pos.stop_loss_price:
+                            pos.stop_loss_price = new_sl
+                elif pos.side == "SELL":
+                    profit = pos.entry_price - current_price
+                    if profit >= trail_threshold:
+                        new_sl = pos.entry_price - 0.01
+                        if new_sl < pos.stop_loss_price:
+                            pos.stop_loss_price = new_sl
 
-            # Check stop loss
-            if pos.side == "BUY" and current_price <= pos.stop_loss_price:
-                self._close_position(pos, current_price, "stop_loss")
-                closed.append(pos)
-                continue
+                # Check stop loss
+                if pos.side == "BUY" and current_price <= pos.stop_loss_price:
+                    self._close_position(pos, current_price, "stop_loss")
+                    closed.append(pos)
+                    continue
 
-            if pos.side == "SELL" and current_price >= pos.stop_loss_price:
-                self._close_position(pos, current_price, "stop_loss")
-                closed.append(pos)
-                continue
+                if pos.side == "SELL" and current_price >= pos.stop_loss_price:
+                    self._close_position(pos, current_price, "stop_loss")
+                    closed.append(pos)
+                    continue
 
-            # Check take profit
-            if pos.side == "BUY" and current_price >= pos.take_profit_price:
-                self._close_position(pos, current_price, "take_profit")
-                closed.append(pos)
-                continue
+            # Check take profit (only if TP is set)
+            if has_tp:
+                if pos.side == "BUY" and current_price >= pos.take_profit_price:
+                    self._close_position(pos, current_price, "take_profit")
+                    closed.append(pos)
+                    continue
 
-            if pos.side == "SELL" and current_price <= pos.take_profit_price:
-                self._close_position(pos, current_price, "take_profit")
-                closed.append(pos)
-                continue
+                if pos.side == "SELL" and current_price <= pos.take_profit_price:
+                    self._close_position(pos, current_price, "take_profit")
+                    closed.append(pos)
+                    continue
 
-            # Near-expiry handling: exit before resolution to avoid gap risk.
-            # 5-min markets can gap 30-40c at resolution (token -> 0 or 1).
-            # An 8c stop becomes a 40c loss if we hold through resolution.
+            # Near-expiry handling — strategy-dependent:
+            # MM/spot_div: exit before resolution to avoid gap risk.
+            #   5-min markets gap 30-40c at resolution (token → 0 or 1).
+            # Grinder/bilateral: HOLD through resolution — resolution IS the profit.
+            #   When the book disappears, the "market_expired" handler above closes
+            #   at last known price (paper) or Polymarket pays out (live).
             if pos.max_hold_until > 0:
                 time_left = pos.max_hold_until - time.time()
-                # Within 2 min + in profit -> lock in gains
-                if time_left <= 120 and pos.unrealized_pnl > 0:
-                    self._close_position(pos, current_price, "near_expiry_profit")
-                    closed.append(pos)
-                    continue
-                # Within 30 sec -> exit regardless to avoid resolution gap
-                if time_left <= 30:
-                    reason = "near_expiry_profit" if pos.unrealized_pnl > 0 else "near_expiry_exit"
-                    self._close_position(pos, current_price, reason)
-                    closed.append(pos)
-                    continue
+                is_hold_strat = pos.strategy in ("high_prob_grinder", "bilateral_arb")
 
-            # Check max hold time
-            if pos.max_hold_until > 0 and time.time() >= pos.max_hold_until:
-                self._close_position(pos, current_price, "max_hold_time")
-                closed.append(pos)
-                continue
+                if not is_hold_strat:
+                    # MM/spot_div: exit early to avoid gap risk
+                    if time_left <= 120 and pos.unrealized_pnl > 0:
+                        self._close_position(pos, current_price, "near_expiry_profit")
+                        closed.append(pos)
+                        continue
+                    if time_left <= 30:
+                        reason = "near_expiry_profit" if pos.unrealized_pnl > 0 else "near_expiry_exit"
+                        self._close_position(pos, current_price, reason)
+                        closed.append(pos)
+                        continue
+
+                # Max hold time (fallback for strategies using config default)
+                if time.time() >= pos.max_hold_until and not is_hold_strat:
+                    self._close_position(pos, current_price, "max_hold_time")
+                    closed.append(pos)
+                    continue
 
         if closed:
             self._save_state()
