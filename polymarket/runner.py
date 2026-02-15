@@ -281,7 +281,9 @@ _FEED_INTO_MM = {"spot_divergence"}
 # frequent updates for short-duration markets).
 _HEAVY_SCAN_INTERVAL = 300  # seconds (5 minutes)
 _last_heavy_scan: dict[str, float] = {}  # strategy_name → last scan time
-_HEAVY_STRATEGIES = {"high_prob_grinder", "bilateral_arb"}
+# Grinder removed: it throttles its own Gamma scan internally so the
+# fast Up/Down lock scanner can run every cycle.
+_HEAVY_STRATEGIES = {"bilateral_arb"}
 
 
 def _compute_mm_boost(scout_signals: list[Signal],
