@@ -337,9 +337,17 @@ class RiskManager:
 
         limits = self.bankroll.get_effective_limits()
 
+        open_positions = [p for p in state.positions if p.status == "open"]
+
+        # Lock signals (buying the opposite side of a held position)
+        # ALWAYS allowed — they convert directional risk into guaranteed
+        # profit. A lock reduces risk, so bypass asset/exposure limits.
+        is_lock = self._is_lock_signal(signal, open_positions)
+        if is_lock:
+            return True, "OK (lock — reduces risk)"
+
         # Check correlation: don't stack too many positions on the same asset
         # Market maker gets its own higher limit — it's hedged (both sides)
-        open_positions = [p for p in state.positions if p.status == "open"]
         same_asset = [p for p in open_positions if p.asset == signal.asset]
         is_mm = getattr(signal, "strategy", "") == "market_maker"
         max_per_asset = MARKET_MAKER["max_positions"] if is_mm else 2
@@ -377,6 +385,34 @@ class RiskManager:
                                f"({signal.edge:.3f} < {STRATEGY['min_edge'] * 1.5:.3f})")
 
         return True, "OK"
+
+    @staticmethod
+    def _is_lock_signal(signal, open_positions) -> bool:
+        """Check if a signal is locking an existing position.
+
+        A lock buys the OPPOSITE side of a market we already hold.
+        Example: we hold Up on condition ABC, now buying Down on ABC.
+        This guarantees $1.00 payout = risk-free.
+        """
+        cond = signal.market.condition_id
+        sig_side = signal.token_side
+
+        # Bilateral arb legs (immediate lock) are always locks
+        if getattr(signal, "is_bilateral", False):
+            return True
+
+        # Check if we hold the opposite side on the same condition
+        for pos in open_positions:
+            if pos.condition_id != cond or pos.status != "open":
+                continue
+            # Opposite sides: Up↔Down, YES↔NO
+            if (pos.token_side == "Up" and sig_side == "Down" or
+                    pos.token_side == "Down" and sig_side == "Up" or
+                    pos.token_side == "YES" and sig_side == "NO" or
+                    pos.token_side == "NO" and sig_side == "YES"):
+                return True
+
+        return False
 
     def adjust_size(self, signal: Signal,
                     state: ExecutionState) -> float:

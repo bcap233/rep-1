@@ -84,6 +84,12 @@ _DEFAULTS = {
     ],
     "scan_limit": 200,
     "min_edge": 0.01,
+    # Spread-lock: buy both sides of an Up/Down market for guaranteed profit.
+    # lock_max_total = max you'll pay for Up + Down combined (< $1.00).
+    # lock_min_profit = minimum net profit per share after fees to bother.
+    "lock_max_total": 0.98,
+    "lock_min_profit": 0.005,
+    "lock_fee_rate": 0.02,
 }
 
 
@@ -132,6 +138,9 @@ class HighProbGrinder(BaseStrategy):
         self.cfg = {**_DEFAULTS, **HIGH_PROB_GRINDER}
         # Track what we've already bought this session to avoid duplicates
         self._seen_conditions: set[str] = set()
+        # Open legs on Up/Down markets, waiting for lock opportunities.
+        # condition_id → {side, entry_price, other_token_id, other_side, market}
+        self._open_legs: dict[str, dict] = {}
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
         """
@@ -169,7 +178,6 @@ class HighProbGrinder(BaseStrategy):
 
         logger.info(f"[GRINDER] Fetched {len(all_markets)} event markets, filtering...")
 
-        signals = []
         scanned = 0
         filtered_prob = 0
         filtered_liquidity = 0
@@ -320,11 +328,17 @@ class HighProbGrinder(BaseStrategy):
         return signals
 
     def _scan_updown_markets(self) -> list[Signal]:
-        """Scan BTC Up/Down 5m/15m markets for high-probability setups.
+        """Scan BTC Up/Down 5m/15m markets for high-prob AND lock setups.
 
-        When BTC has clear momentum, one side of these markets sits at
-        90%+. Buy that side and hold to resolution (5-15 minutes) to
-        collect $1.00. Fast capital turnover = law of large numbers.
+        Two modes:
+        1. DIRECTIONAL: Buy high-prob side at 85-97%, hold to resolution.
+        2. SPREAD-LOCK: If we already hold one side (or both sides are
+           cheap right now), buy the other side to lock in guaranteed
+           profit. Total cost < $1.00 → riskless.
+
+        When BTC has momentum, buy the strong side. If the spread
+        tightens or reverses, lock in the gain instead of holding to
+        resolution.
         """
         from .market_maker import _parse_market_duration, _minutes_to_market_end
 
@@ -332,15 +346,18 @@ class HighProbGrinder(BaseStrategy):
         durations = MARKET_MAKER.get("durations", ["5m", "15m"])
         min_minutes = MARKET_MAKER.get("min_minutes_to_expiry", 2)
 
+        # Clean up expired legs before scanning
+        self._expire_stale_legs()
+
         markets = self.client.find_btc_updown_markets(durations)
         if not markets:
             return []
 
         scanned = 0
-        for market in markets:
-            if market.condition_id in self._seen_conditions:
-                continue
+        locks_found = 0
+        directional_found = 0
 
+        for market in markets:
             q = market.question
             duration = _parse_market_duration(q)
             if duration not in durations:
@@ -353,23 +370,144 @@ class HighProbGrinder(BaseStrategy):
             if len(market.token_ids) < 2:
                 continue
 
-            # Check both Up (index 0) and Down (index 1) tokens
+            up_token = market.token_ids[0]
+            down_token = market.token_ids[1]
+
+            # Fetch both order books — needed for lock check regardless
+            up_book = self.client.get_order_book(up_token)
+            down_book = self.client.get_order_book(down_token)
+            if not up_book or not down_book:
+                continue
+            if not up_book.asks or not down_book.asks:
+                continue
+            scanned += 1
+
+            # --- MODE 1: IMMEDIATE LOCK ---
+            # Both sides available right now with total < lock threshold.
+            # This is pure arb — guaranteed profit, no directional risk.
+            up_ask = up_book.best_ask
+            down_ask = down_book.best_ask
+            total_cost = up_ask + down_ask
+
+            max_profit_side = max(1.0 - up_ask, 1.0 - down_ask)
+            fee = self.cfg["lock_fee_rate"] * max_profit_side
+            net_profit = 1.0 - total_cost - fee
+
+            if (total_cost <= self.cfg["lock_max_total"]
+                    and net_profit >= self.cfg["lock_min_profit"]):
+                up_depth = sum(s for _, s in up_book.asks[:3])
+                down_depth = sum(s for _, s in down_book.asks[:3])
+                min_depth = min(up_depth, down_depth)
+
+                if min_depth >= self.cfg["min_ask_depth"]:
+                    max_price = max(up_ask, down_ask)
+                    size = max(1, int(self.cfg["size_per_trade_usdc"] / max_price))
+                    size = min(size, int(min_depth))
+
+                    signal = Signal(
+                        asset="BTC",
+                        market=market,
+                        token_id=up_token,
+                        side="BUY",
+                        token_side="Up+Down",
+                        spot_price=0.0,
+                        target_price=0.0,
+                        implied_prob=total_cost,
+                        fair_prob=1.0,
+                        edge=net_profit,
+                        confidence=0.99,
+                        momentum_score=0.0,
+                        momentum_direction="n/a",
+                        confirming_timeframes=0,
+                        suggested_price=round(total_cost, 2),
+                        suggested_size=size,
+                        timestamp=time.time(),
+                        reason=(
+                            f"LOCK-IMMEDIATE: Up@{up_ask:.2f}+Down@{down_ask:.2f}"
+                            f"={total_cost:.2f} ({duration}, {mins_left:.0f}m) | "
+                            f"profit={net_profit:.3f}/sh (${net_profit*size:.2f})"
+                        ),
+                        strategy="high_prob_grinder",
+                        arb_legs=[
+                            {"token_id": up_token, "side": "BUY",
+                             "price": up_ask, "label": "Up"},
+                            {"token_id": down_token, "side": "BUY",
+                             "price": down_ask, "label": "Down"},
+                        ],
+                    )
+                    signals.append(signal)
+                    locks_found += 1
+                    # Don't mark as seen — we might also want a directional
+                    # entry if the lock doesn't execute (size limited, etc.)
+                    continue  # Lock takes priority over directional
+
+            # --- MODE 2: DELAYED LOCK ---
+            # We already hold one side from a previous scan. Check if the
+            # other side is now cheap enough to lock in profit.
+            cond = market.condition_id
+            if cond in self._open_legs:
+                leg = self._open_legs[cond]
+                other_token = leg["other_token_id"]
+                other_book = (down_book if leg["side"] == "Up" else up_book)
+                other_ask = other_book.best_ask
+
+                lock_total = leg["entry_price"] + other_ask
+                lock_profit = 1.0 - lock_total - fee
+                other_depth = sum(s for _, s in other_book.asks[:3])
+
+                if (lock_total <= self.cfg["lock_max_total"]
+                        and lock_profit >= self.cfg["lock_min_profit"]
+                        and other_depth >= self.cfg["min_ask_depth"]):
+                    size = max(1, int(self.cfg["size_per_trade_usdc"] / other_ask))
+                    size = min(size, int(other_depth), leg["size"])
+
+                    signal = Signal(
+                        asset="BTC",
+                        market=market,
+                        token_id=other_token,
+                        side="BUY",
+                        token_side=leg["other_side"],
+                        spot_price=0.0,
+                        target_price=0.0,
+                        implied_prob=other_ask,
+                        fair_prob=1.0,
+                        edge=lock_profit,
+                        confidence=0.99,
+                        momentum_score=0.0,
+                        momentum_direction="n/a",
+                        confirming_timeframes=0,
+                        suggested_price=round(other_ask, 2),
+                        suggested_size=size,
+                        timestamp=time.time(),
+                        reason=(
+                            f"LOCK-DELAYED: held {leg['side']}@{leg['entry_price']:.2f}"
+                            f" + buy {leg['other_side']}@{other_ask:.2f}"
+                            f"={lock_total:.2f} ({duration}, {mins_left:.0f}m) | "
+                            f"locked profit={lock_profit:.3f}/sh"
+                        ),
+                        strategy="high_prob_grinder",
+                    )
+                    signals.append(signal)
+                    locks_found += 1
+                    # Remove the tracked leg — it's now locked
+                    del self._open_legs[cond]
+                    continue
+
+            # --- MODE 3: DIRECTIONAL ENTRY ---
+            # One side is at 85-97%. Buy it and hold to resolution.
+            # Also track it as an open leg for potential lock later.
+            if cond in self._seen_conditions:
+                continue
+
             sides = [
-                (market.token_ids[0], "Up"),
-                (market.token_ids[1], "Down"),
+                (up_token, "Up", up_book, down_token, "Down"),
+                (down_token, "Down", down_book, up_token, "Up"),
             ]
 
-            for token_id, token_side in sides:
-                book = self.client.get_order_book(token_id)
-                if not book or not book.asks:
-                    continue
-
-                scanned += 1
+            for token_id, token_side, book, other_tok, other_side in sides:
                 mid = book.midpoint
-
                 if mid < self.cfg["min_probability"] or mid > self.cfg["max_probability"]:
                     continue
-
                 if book.spread > self.cfg["max_spread"]:
                     continue
 
@@ -382,27 +520,22 @@ class HighProbGrinder(BaseStrategy):
                     continue
 
                 profit_per_share = 1.0 - entry_price
-                loss_per_share = entry_price
                 implied_prob = entry_price
-                # Up/Down markets with strong momentum: true prob slightly
-                # higher than implied when one side is at 90%+
                 estimated_true_prob = min(0.99, implied_prob + 0.02)
 
                 ev_per_share = (estimated_true_prob * profit_per_share -
-                                (1 - estimated_true_prob) * loss_per_share)
+                                (1 - estimated_true_prob) * entry_price)
 
                 if ev_per_share < self.cfg["min_edge"] * profit_per_share:
                     continue
 
                 size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
 
-                # Confidence: higher in sweet spot, boost for short duration
                 if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
                     confidence = 0.85
                 else:
                     confidence = 0.65
 
-                # Short-duration markets resolve fast = less uncertainty
                 if duration == "5m":
                     confidence = min(1.0, confidence + 0.05)
 
@@ -433,12 +566,34 @@ class HighProbGrinder(BaseStrategy):
                     strategy="high_prob_grinder",
                 )
                 signals.append(signal)
-                self._seen_conditions.add(market.condition_id)
+                self._seen_conditions.add(cond)
+                directional_found += 1
+
+                # Track this leg for delayed lock on next scan
+                self._open_legs[cond] = {
+                    "side": token_side,
+                    "entry_price": entry_price,
+                    "other_token_id": other_tok,
+                    "other_side": other_side,
+                    "size": size,
+                    "market": market,
+                    "time": time.time(),
+                }
                 break  # One signal per market (best side wins)
 
-        logger.info(f"[GRINDER] Up/Down scan: {scanned} books checked, "
-                     f"{len(signals)} high-prob setups found")
+        logger.info(f"[GRINDER] Up/Down scan: {scanned} markets | "
+                     f"{locks_found} locks + {directional_found} directional")
         return signals
+
+    def _expire_stale_legs(self):
+        """Remove open legs older than 20 minutes (market has resolved)."""
+        cutoff = time.time() - 20 * 60
+        expired = [cid for cid, leg in self._open_legs.items()
+                   if leg["time"] < cutoff]
+        for cid in expired:
+            del self._open_legs[cid]
+        if expired:
+            logger.debug(f"[GRINDER] Expired {len(expired)} stale legs")
 
     def reset_seen(self):
         """Clear the seen-conditions cache (e.g., new trading session)."""
