@@ -28,17 +28,118 @@ Filters:
 """
 
 import logging
+import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from . import BaseStrategy, register_strategy
 from ..config import ASSETS, HIGH_PROB_GRINDER, EVENT_CATEGORIES, MARKET_MAKER
+from ..exchanges import get_composite_price
 from ..polymarket_client import PolymarketClient, Market, OrderBook
 from ..signals import Signal
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Probability model for BTC Up/Down markets
+# ---------------------------------------------------------------------------
+# A "BTC Up or Down" market resolves to "Up" if BTC closes above its
+# price at market open, "Down" otherwise. This is equivalent to a
+# digital (binary) option.
+#
+# Model: random walk with drift=0 (conservative), volatility σ per minute.
+#   P(BTC stays above reference | currently X% above, T min left)
+#     = Φ(X / (σ√T))
+#   where Φ is the standard normal CDF.
+#
+# This gives us a MODEL-BASED true probability to compare against the
+# market's implied probability (best ask). The edge is:
+#   edge = model_prob - implied_prob
+# We only trade when edge > fee + minimum threshold.
+
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF using the error function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _model_up_probability(
+    spot: float,
+    reference: float,
+    mins_left: float,
+    vol_per_min: float,
+) -> float:
+    """Compute model probability of BTC finishing above reference.
+
+    Args:
+        spot: Current BTC price
+        reference: BTC price at market window open
+        mins_left: Minutes until market closes
+        vol_per_min: Estimated BTC per-minute return volatility (e.g. 0.0004)
+
+    Returns:
+        Probability [0.01, 0.99] that BTC finishes above reference.
+    """
+    if mins_left <= 0.1:
+        # Basically resolved — if above, it's up
+        return 0.99 if spot > reference else 0.01
+    if reference <= 0:
+        return 0.50
+
+    delta_pct = (spot - reference) / reference  # e.g. +0.003 = up 0.3%
+    sigma_t = vol_per_min * math.sqrt(mins_left)
+
+    if sigma_t < 1e-8:
+        return 0.99 if delta_pct > 0 else 0.01
+
+    z = delta_pct / sigma_t
+    # Clamp to avoid extreme tails
+    z = max(-4.0, min(4.0, z))
+    return max(0.01, min(0.99, _normal_cdf(z)))
+
+
+def _parse_market_start_time(question: str) -> Optional[datetime]:
+    """Parse the START time of an Up/Down market from its question text.
+
+    Example: "Bitcoin Up or Down - February 15, 12:15AM-12:30AM ET"
+    Returns: datetime(2026, 2, 15, 5, 15, tzinfo=UTC)  (12:15 AM ET = 5:15 UTC)
+    """
+    m = re.search(
+        r'(\w+ \d+),?\s*(\d{1,2}):(\d{2})(am|pm)\s*-\s*\d{1,2}:\d{2}(?:am|pm)\s*et',
+        question.lower(),
+    )
+    if not m:
+        return None
+
+    date_str = m.group(1)  # "february 15"
+    h, mi, p = int(m.group(2)), int(m.group(3)), m.group(4)
+
+    if p == 'pm' and h != 12:
+        h += 12
+    if p == 'am' and h == 12:
+        h = 0
+
+    now = datetime.now(timezone.utc)
+    try:
+        start_dt = datetime.strptime(
+            f"{date_str} {now.year} {h:02d}:{mi:02d}",
+            "%B %d %Y %H:%M",
+        ).replace(tzinfo=timezone.utc)
+        # ET → UTC
+        from ..execution import _et_to_utc_offset_hours
+        start_dt = start_dt + timedelta(hours=_et_to_utc_offset_hours())
+    except ValueError:
+        return None
+
+    return start_dt
+
+
+# Default BTC per-minute return volatility.
+# BTC 5-minute vol is typically 0.05-0.15%, so per-minute ≈ 0.03-0.07%.
+# We use a moderate estimate; will be refined with live data.
+_DEFAULT_VOL_PER_MIN = 0.0004  # 0.04% per minute
 
 
 def _classify_market(question_lower: str) -> str:
@@ -164,6 +265,14 @@ class HighProbGrinder(BaseStrategy):
         # direction over 2-3 scans, enter even at lower thresholds.
         self._mid_history: dict[str, list[tuple[float, float]]] = {}
         self._mid_history_max = 6  # Keep last ~60s of scans
+        # Reference price tracker: condition_id → (start_time_utc, btc_spot_at_start).
+        # Records BTC spot when we first see each market window.
+        # Used by the probability model: P(up) = Φ(delta / (σ√T)).
+        self._reference_prices: dict[str, tuple[datetime, float]] = {}
+        # Running volatility estimate (per-minute returns).
+        # Updated from scan-to-scan spot price changes.
+        self._spot_history: list[tuple[float, float]] = []  # (timestamp, spot)
+        self._vol_per_min: float = _DEFAULT_VOL_PER_MIN
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
         """
@@ -358,13 +467,47 @@ class HighProbGrinder(BaseStrategy):
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals
 
+    def _update_vol_estimate(self, spot: float) -> None:
+        """Update running per-minute volatility estimate from spot changes."""
+        now = time.time()
+        self._spot_history.append((now, spot))
+        # Keep last 30 data points (~5 min at 10s intervals)
+        self._spot_history = self._spot_history[-30:]
+
+        if len(self._spot_history) < 3:
+            return
+
+        # Compute per-interval returns, then scale to per-minute
+        returns = []
+        for i in range(1, len(self._spot_history)):
+            t0, p0 = self._spot_history[i - 1]
+            t1, p1 = self._spot_history[i]
+            dt_min = (t1 - t0) / 60.0
+            if dt_min > 0 and p0 > 0:
+                ret = (p1 - p0) / p0
+                # Scale to per-minute
+                returns.append(ret / math.sqrt(max(dt_min, 0.1)))
+
+        if len(returns) >= 2:
+            mean_r = sum(returns) / len(returns)
+            var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            estimated = math.sqrt(var)
+            # Blend with default (avoid extreme estimates from thin data)
+            self._vol_per_min = 0.5 * estimated + 0.5 * _DEFAULT_VOL_PER_MIN
+            # Floor: don't go below 0.01% per min (unrealistically calm)
+            self._vol_per_min = max(0.0001, self._vol_per_min)
+
     def _scan_updown_markets(self) -> list[Signal]:
         """Scan BTC Up/Down 5m/15m markets for locks and directional entries.
 
         Priority order (checked for each market):
         1. IMMEDIATE LOCK: Up_ask + Down_ask < $0.98 right now → buy both
         2. DELAYED LOCK: We hold one side, other side now cheap → lock
-        3. DIRECTIONAL: One side at 78%+ → buy, track for future lock
+        3. MODEL DIRECTIONAL: Compare model prob to market prob → buy if edge
+
+        The model uses a random walk:
+          P(up) = Φ((spot - ref) / (σ√T))
+        where ref = BTC price at market open, σ = per-minute vol, T = mins left.
 
         Runs every cycle (not throttled) because locks on 5m markets
         need fast reaction — can't wait 5 min between scans.
@@ -377,6 +520,12 @@ class HighProbGrinder(BaseStrategy):
         fee_rate = self.cfg["lock_fee_rate"]
 
         self._expire_stale_legs()
+
+        # Fetch current BTC spot for the probability model
+        composite = get_composite_price("BTC")
+        btc_spot = composite.price if composite else 0.0
+        if btc_spot > 0:
+            self._update_vol_estimate(btc_spot)
 
         markets = self.client.find_btc_updown_markets(durations)
         if not markets:
@@ -399,6 +548,18 @@ class HighProbGrinder(BaseStrategy):
             if len(market.token_ids) < 2:
                 continue
 
+            cond = market.condition_id
+
+            # Record BTC spot as reference price when we first see this market.
+            # If the market just started (we catch it within the first scan),
+            # this is very close to the true reference price.
+            if cond not in self._reference_prices and btc_spot > 0:
+                start_time = _parse_market_start_time(q)
+                self._reference_prices[cond] = (
+                    start_time or datetime.now(timezone.utc),
+                    btc_spot,
+                )
+
             up_token = market.token_ids[0]
             down_token = market.token_ids[1]
 
@@ -413,7 +574,6 @@ class HighProbGrinder(BaseStrategy):
             up_ask = up_book.best_ask
             down_ask = down_book.best_ask
             up_mid = up_book.midpoint
-            cond = market.condition_id
 
             # Record midpoint for momentum tracking
             now_ts = time.time()
@@ -514,54 +674,46 @@ class HighProbGrinder(BaseStrategy):
                             del self._open_legs[cond]
                             continue
 
-            # --- MODE 3: DIRECTIONAL ENTRY ---
-            # Two thresholds:
-            #   Static: 78%+ (works without momentum data)
-            #   Momentum: 62%+ if midpoint is trending 5%+ over recent scans
+            # --- MODE 3: MODEL-BASED DIRECTIONAL ---
+            # Use the random walk model to compute true probability from
+            # actual BTC spot data, then compare to market price.
             #
-            # Books are thin and move fast. Catching a trend at 65% and
-            # riding it to 85%+ (or locking) beats waiting for 78%.
+            # P(up) = Φ((spot - ref) / (σ√T))
+            #
+            # Only trade when model_prob - implied_prob > fee + min_edge.
+            # This replaces the made-up "+2% edge" with a real computation.
             if cond in self._seen_conditions:
                 continue
 
-            # Pick threshold based on momentum
-            has_momentum = abs(mid_delta) >= self.cfg["momentum_min_delta"]
-            if has_momentum:
-                min_prob = self.cfg["momentum_min_probability"]
-            else:
-                min_prob = self.cfg["updown_min_probability"]
-            max_prob = self.cfg["max_probability"]
             min_depth = self.cfg["updown_min_ask_depth"]
 
-            # Order sides so momentum-confirmed side is checked first
-            if mid_direction == "down":
-                sides = [
-                    (down_token, "Down", down_book, up_token, "Up"),
-                    (up_token, "Up", up_book, down_token, "Down"),
-                ]
-            else:
-                sides = [
-                    (up_token, "Up", up_book, down_token, "Down"),
-                    (down_token, "Down", down_book, up_token, "Up"),
-                ]
+            # Get reference price for this market window
+            ref_data = self._reference_prices.get(cond)
+            ref_price = ref_data[1] if ref_data else 0.0
 
-            for token_id, token_side, book, other_tok, other_side in sides:
-                mid = book.midpoint
-
-                # Check if this side has momentum confirmation
-                side_has_momentum = (
-                    has_momentum and
-                    ((token_side == "Up" and mid_direction == "up") or
-                     (token_side == "Down" and mid_direction == "down"))
+            # Compute model probability of "Up"
+            if btc_spot > 0 and ref_price > 0:
+                model_up = _model_up_probability(
+                    btc_spot, ref_price, mins_left, self._vol_per_min,
                 )
+                model_down = 1.0 - model_up
+            else:
+                # No spot data — fall back to market midpoint
+                model_up = up_mid
+                model_down = 1.0 - up_mid
 
-                # Use momentum threshold only for the confirmed side
-                effective_min = (self.cfg["momentum_min_probability"]
-                                 if side_has_momentum
-                                 else self.cfg["updown_min_probability"])
+            delta_pct = ((btc_spot - ref_price) / ref_price * 100
+                         if ref_price > 0 else 0.0)
 
-                if mid < effective_min or mid > max_prob:
-                    continue
+            # Check both sides for model edge
+            sides = [
+                (up_token, "Up", up_book, down_token, "Down", model_up),
+                (down_token, "Down", down_book, up_token, "Up", model_down),
+            ]
+            # Check the model-favored side first
+            sides.sort(key=lambda s: s[5], reverse=True)
+
+            for token_id, token_side, book, other_tok, other_side, model_prob in sides:
                 if book.spread > self.cfg["max_spread"]:
                     continue
 
@@ -570,54 +722,38 @@ class HighProbGrinder(BaseStrategy):
                     continue
 
                 entry_price = book.best_ask
-                if entry_price > max_prob:
+                implied_prob = entry_price
+
+                # The edge: model says X%, market says Y%.
+                # Fee is ~2% on the winning payout.
+                effective_fee = fee_rate * (1.0 - entry_price)
+                edge = model_prob - implied_prob - effective_fee
+
+                if edge < 0.03:
+                    # Need at least 3% model edge to overcome noise
                     continue
 
                 profit_per_share = 1.0 - entry_price
-                implied_prob = entry_price
+                ev_per_share = (model_prob * profit_per_share -
+                                (1 - model_prob) * entry_price)
 
-                # Time-decay + momentum edge:
-                # Base edge from time remaining (price accuracy)
-                if mins_left <= 2:
-                    edge_boost = 0.04
-                elif mins_left <= 5:
-                    edge_boost = 0.025
-                else:
-                    edge_boost = 0.015
-
-                # Momentum adds edge — the trend is likely to continue
-                if side_has_momentum:
-                    edge_boost += min(0.03, abs(mid_delta))
-
-                estimated_true_prob = min(0.99, implied_prob + edge_boost)
-
-                ev_per_share = (estimated_true_prob * profit_per_share -
-                                (1 - estimated_true_prob) * entry_price)
-
-                if ev_per_share < self.cfg["min_edge"] * profit_per_share:
+                if ev_per_share <= 0:
                     continue
 
                 size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
 
-                # Confidence: probability + time + momentum
-                if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
-                    confidence = 0.85
-                elif entry_price >= 0.85:
-                    confidence = 0.75
-                elif side_has_momentum:
-                    # Momentum-confirmed at lower prob: moderate confidence
-                    confidence = 0.65
+                # Confidence from model certainty and time
+                if model_prob >= 0.90:
+                    confidence = 0.90
+                elif model_prob >= 0.80:
+                    confidence = 0.80
+                elif model_prob >= 0.70:
+                    confidence = 0.70
                 else:
-                    confidence = 0.55
+                    confidence = 0.60
 
-                # Time boost: less time left = more certainty
+                # Time boost: less time = model is more reliable
                 if mins_left <= 3:
-                    confidence = min(1.0, confidence + 0.10)
-                elif duration == "5m":
-                    confidence = min(1.0, confidence + 0.05)
-
-                # Momentum boost
-                if side_has_momentum:
                     confidence = min(1.0, confidence + 0.05)
 
                 signal = Signal(
@@ -626,24 +762,25 @@ class HighProbGrinder(BaseStrategy):
                     token_id=token_id,
                     side="BUY",
                     token_side=token_side,
-                    spot_price=0.0,
-                    target_price=0.0,
+                    spot_price=btc_spot,
+                    target_price=ref_price,
                     implied_prob=implied_prob,
-                    fair_prob=estimated_true_prob,
+                    fair_prob=model_prob,
                     edge=ev_per_share,
                     confidence=confidence,
-                    momentum_score=0.0,
-                    momentum_direction="n/a",
+                    momentum_score=mid_delta,
+                    momentum_direction=mid_direction,
                     confirming_timeframes=0,
                     suggested_price=round(entry_price, 2),
                     suggested_size=size,
                     timestamp=time.time(),
                     reason=(
-                        f"GRINDER-UPDOWN: {token_side}@{entry_price:.2f} "
+                        f"MODEL: {token_side}@{entry_price:.2f} "
                         f"({duration}, {mins_left:.0f}m left) | "
-                        f"edge+{edge_boost:.1%} EV={ev_per_share:+.4f}/sh | "
-                        f"Δ={mid_delta:+.2f} "
-                        f"{'↑MOMENTUM' if side_has_momentum else ''}"
+                        f"model={model_prob:.1%} mkt={implied_prob:.1%} "
+                        f"edge={edge:+.1%} | "
+                        f"BTC {delta_pct:+.3f}% vs ref "
+                        f"σ={self._vol_per_min:.4f}/min"
                     ),
                     strategy="high_prob_grinder",
                 )
@@ -722,20 +859,22 @@ class HighProbGrinder(BaseStrategy):
         )
 
     def _expire_stale_legs(self):
-        """Remove open legs and stale history older than 20 minutes."""
+        """Remove open legs, stale history, and old references (>20 min)."""
         cutoff = time.time() - 20 * 60
         expired = [cid for cid, leg in self._open_legs.items()
                    if leg["time"] < cutoff]
         for cid in expired:
             del self._open_legs[cid]
             self._mid_history.pop(cid, None)
+            self._reference_prices.pop(cid, None)
         if expired:
             logger.debug(f"[GRINDER] Expired {len(expired)} stale legs")
-        # Also clean history for markets we no longer see
+        # Also clean history/refs for markets we no longer see
         stale_hist = [cid for cid, hist in self._mid_history.items()
                       if hist and hist[-1][0] < cutoff]
         for cid in stale_hist:
             del self._mid_history[cid]
+            self._reference_prices.pop(cid, None)
 
     def reset_seen(self):
         """Clear the seen-conditions cache (e.g., new trading session)."""
