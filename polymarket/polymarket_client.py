@@ -320,25 +320,34 @@ class PolymarketClient:
         return price_markets
 
     def find_btc_updown_markets(self, durations: list[str] | None = None) -> list[Market]:
+        """Legacy wrapper — redirects to find_updown_markets('BTC')."""
+        return self.find_updown_markets("BTC", durations)
+
+    def find_updown_markets(
+        self, asset: str, durations: list[str] | None = None,
+    ) -> list[Market]:
         """
-        Discover short-duration Bitcoin "Up or Down" markets.
+        Discover short-duration "Up or Down" markets for any crypto asset.
 
         These markets (5m, 15m, 4h) are not returned by the Gamma search API.
         They follow a deterministic slug pattern based on the current time:
-            btc-updown-{duration}-{aligned_unix_timestamp}
+            {asset}-updown-{duration}-{aligned_unix_timestamp}
+            e.g. btc-updown-5m-1771132800, eth-updown-15m-1771133700
 
         Returns the current and next upcoming markets for each duration.
         """
-        from .config import BTC_UPDOWN_DURATIONS
+        from .config import UPDOWN_DURATIONS, UPDOWN_SLUG_PREFIX
+
+        slug_prefix = UPDOWN_SLUG_PREFIX.get(asset, asset.lower())
 
         if durations is None:
-            durations = list(BTC_UPDOWN_DURATIONS.keys())
+            durations = list(UPDOWN_DURATIONS.keys())
 
         now = int(time.time())
         markets = []
 
         for dur in durations:
-            dur_cfg = BTC_UPDOWN_DURATIONS.get(dur)
+            dur_cfg = UPDOWN_DURATIONS.get(dur)
             if not dur_cfg:
                 continue
 
@@ -350,7 +359,7 @@ class PolymarketClient:
 
             # Fetch current window + next window (and previous for recently-closed)
             for ts in [current_start - interval, current_start, current_start + interval]:
-                slug = f"btc-updown-{dur}-{ts}"
+                slug = f"{slug_prefix}-updown-{dur}-{ts}"
                 url = f"{self.gamma_url}/events?slug={slug}"
                 data = _http_get(url)
                 if not data:
@@ -387,10 +396,10 @@ class PolymarketClient:
                         closed=closed,
                         volume=float(m_data.get("volume", 0)),
                         liquidity=float(m_data.get("liquidity", 0)),
-                        tags=["crypto", "bitcoin", "btc-updown", dur],
+                        tags=["crypto", asset.lower(), f"{slug_prefix}-updown", dur],
                     ))
 
-        logger.info(f"BTC Up/Down discovery: {len(markets)} active markets "
+        logger.info(f"{asset} Up/Down discovery: {len(markets)} active markets "
                      f"across {durations}")
         return markets
 

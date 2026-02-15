@@ -130,12 +130,14 @@ ASSETS = {
         "coinbase": "ETH-USD",
         "kraken": "XETHZUSD",
         "polymarket_tags": ["ethereum", "eth"],
+        "updown_enabled": True,
     },
     "SOL": {
         "binance": "SOLUSDT",
         "coinbase": "SOL-USD",
         "kraken": "SOLUSD",
         "polymarket_tags": ["solana", "sol"],
+        "updown_enabled": True,
     },
 }
 
@@ -148,13 +150,21 @@ ASSETS = {
 TIMEFRAMES = [5, 10, 15]  # minutes
 
 # ============================================================
-# BTC UP/DOWN SHORT-DURATION MARKETS
+# CRYPTO UP/DOWN SHORT-DURATION MARKETS
 # ============================================================
 # These markets follow a deterministic slug pattern on Polymarket:
-#   btc-updown-{duration}-{aligned_unix_timestamp}
+#   {asset}-updown-{duration}-{aligned_unix_timestamp}
+#   e.g. btc-updown-5m-1771132800, eth-updown-15m-1771133700
 # They are not discoverable via the Gamma search API.
 
-BTC_UPDOWN_DURATIONS = {
+# Slug prefixes for each asset (maps to Polymarket's naming)
+UPDOWN_SLUG_PREFIX = {
+    "BTC": "btc",
+    "ETH": "eth",
+    "SOL": "sol",
+}
+
+UPDOWN_DURATIONS = {
     "5m": {
         "interval_seconds": 300,
         "offset_seconds": 0,

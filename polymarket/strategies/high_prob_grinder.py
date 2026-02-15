@@ -265,14 +265,17 @@ class HighProbGrinder(BaseStrategy):
         # direction over 2-3 scans, enter even at lower thresholds.
         self._mid_history: dict[str, list[tuple[float, float]]] = {}
         self._mid_history_max = 6  # Keep last ~60s of scans
-        # Reference price tracker: condition_id → (start_time_utc, btc_spot_at_start).
-        # Records BTC spot when we first see each market window.
+        # Reference price tracker: condition_id → (start_time_utc, spot_at_start).
+        # Records spot when we first see each market window.
         # Used by the probability model: P(up) = Φ(delta / (σ√T)).
         self._reference_prices: dict[str, tuple[datetime, float]] = {}
-        # Running volatility estimate (per-minute returns).
-        # Updated from scan-to-scan spot price changes.
-        self._spot_history: list[tuple[float, float]] = []  # (timestamp, spot)
-        self._vol_per_min: float = _DEFAULT_VOL_PER_MIN
+        # Per-asset volatility tracking.
+        # asset → { "history": [(ts, price), ...], "vol": float }
+        self._asset_vol: dict[str, dict] = {}
+        # Which assets have Up/Down markets enabled
+        self._updown_assets = [
+            a for a, cfg in ASSETS.items() if cfg.get("updown_enabled")
+        ]
 
     def scan(self, assets: Optional[list[str]] = None) -> list[Signal]:
         """
@@ -467,50 +470,51 @@ class HighProbGrinder(BaseStrategy):
         signals.sort(key=lambda s: s.edge, reverse=True)
         return signals
 
-    def _update_vol_estimate(self, spot: float) -> None:
-        """Update running per-minute volatility estimate from spot changes."""
+    def _update_vol_estimate(self, asset: str, spot: float) -> None:
+        """Update running per-minute volatility estimate for an asset."""
         now = time.time()
-        self._spot_history.append((now, spot))
-        # Keep last 30 data points (~5 min at 10s intervals)
-        self._spot_history = self._spot_history[-30:]
+        if asset not in self._asset_vol:
+            self._asset_vol[asset] = {"history": [], "vol": _DEFAULT_VOL_PER_MIN}
 
-        if len(self._spot_history) < 3:
+        av = self._asset_vol[asset]
+        av["history"].append((now, spot))
+        # Keep last 30 data points (~5 min at 10s intervals)
+        av["history"] = av["history"][-30:]
+
+        if len(av["history"]) < 3:
             return
 
         # Compute per-interval returns, then scale to per-minute
         returns = []
-        for i in range(1, len(self._spot_history)):
-            t0, p0 = self._spot_history[i - 1]
-            t1, p1 = self._spot_history[i]
+        for i in range(1, len(av["history"])):
+            t0, p0 = av["history"][i - 1]
+            t1, p1 = av["history"][i]
             dt_min = (t1 - t0) / 60.0
             if dt_min > 0 and p0 > 0:
                 ret = (p1 - p0) / p0
-                # Scale to per-minute
                 returns.append(ret / math.sqrt(max(dt_min, 0.1)))
 
         if len(returns) >= 2:
             mean_r = sum(returns) / len(returns)
             var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
             estimated = math.sqrt(var)
-            # Blend with default (avoid extreme estimates from thin data)
-            self._vol_per_min = 0.5 * estimated + 0.5 * _DEFAULT_VOL_PER_MIN
-            # Floor: don't go below 0.01% per min (unrealistically calm)
-            self._vol_per_min = max(0.0001, self._vol_per_min)
+            av["vol"] = max(0.0001, 0.5 * estimated + 0.5 * _DEFAULT_VOL_PER_MIN)
+
+    def _get_vol(self, asset: str) -> float:
+        """Get current per-minute volatility estimate for an asset."""
+        return self._asset_vol.get(asset, {}).get("vol", _DEFAULT_VOL_PER_MIN)
 
     def _scan_updown_markets(self) -> list[Signal]:
-        """Scan BTC Up/Down 5m/15m markets for locks and directional entries.
+        """Scan crypto Up/Down 5m/15m markets for locks and model entries.
 
-        Priority order (checked for each market):
-        1. IMMEDIATE LOCK: Up_ask + Down_ask < $0.98 right now → buy both
+        Scans all updown-enabled assets (BTC, ETH, SOL).
+
+        Priority order per market:
+        1. IMMEDIATE LOCK: Up_ask + Down_ask < $0.98 → buy both
         2. DELAYED LOCK: We hold one side, other side now cheap → lock
-        3. MODEL DIRECTIONAL: Compare model prob to market prob → buy if edge
+        3. MODEL DIRECTIONAL: model_prob > market_prob + fees → buy
 
-        The model uses a random walk:
-          P(up) = Φ((spot - ref) / (σ√T))
-        where ref = BTC price at market open, σ = per-minute vol, T = mins left.
-
-        Runs every cycle (not throttled) because locks on 5m markets
-        need fast reaction — can't wait 5 min between scans.
+        The model: P(up) = Φ((spot - ref) / (σ√T))
         """
         from .market_maker import _parse_market_duration, _minutes_to_market_end
 
@@ -521,21 +525,31 @@ class HighProbGrinder(BaseStrategy):
 
         self._expire_stale_legs()
 
-        # Fetch current BTC spot for the probability model
-        composite = get_composite_price("BTC")
-        btc_spot = composite.price if composite else 0.0
-        if btc_spot > 0:
-            self._update_vol_estimate(btc_spot)
+        # Fetch spot prices for all enabled assets
+        asset_spots: dict[str, float] = {}
+        for asset in self._updown_assets:
+            composite = get_composite_price(asset)
+            if composite and composite.price > 0:
+                asset_spots[asset] = composite.price
+                self._update_vol_estimate(asset, composite.price)
 
-        markets = self.client.find_btc_updown_markets(durations)
-        if not markets:
+        # Discover markets across all enabled assets
+        all_markets: list[tuple[str, "Market"]] = []  # (asset, market)
+        for asset in self._updown_assets:
+            markets = self.client.find_updown_markets(asset, durations)
+            for m in markets:
+                all_markets.append((asset, m))
+
+        if not all_markets:
             return []
 
         scanned = 0
         locks_found = 0
         directional_found = 0
 
-        for market in markets:
+        for asset, market in all_markets:
+            spot = asset_spots.get(asset, 0.0)
+            vol_per_min = self._get_vol(asset)
             q = market.question
             duration = _parse_market_duration(q)
             if duration not in durations:
@@ -550,14 +564,14 @@ class HighProbGrinder(BaseStrategy):
 
             cond = market.condition_id
 
-            # Record BTC spot as reference price when we first see this market.
+            # Record spot as reference price when we first see this market.
             # If the market just started (we catch it within the first scan),
             # this is very close to the true reference price.
-            if cond not in self._reference_prices and btc_spot > 0:
+            if cond not in self._reference_prices and spot > 0:
                 start_time = _parse_market_start_time(q)
                 self._reference_prices[cond] = (
                     start_time or datetime.now(timezone.utc),
-                    btc_spot,
+                    spot,
                 )
 
             up_token = market.token_ids[0]
@@ -605,7 +619,7 @@ class HighProbGrinder(BaseStrategy):
             if (total_cost <= self.cfg["lock_max_total"]
                     and imm_profit >= self.cfg["lock_min_profit"]):
                 lock_sig = self._make_lock_signal(
-                    market, duration, mins_left,
+                    asset, market, duration, mins_left,
                     up_token, up_ask, up_book,
                     down_token, down_ask, down_book,
                     imm_profit, total_cost, "IMMEDIATE",
@@ -641,7 +655,7 @@ class HighProbGrinder(BaseStrategy):
                         size = min(size, int(other_depth))
                         if size >= 1:
                             signal = Signal(
-                                asset="BTC",
+                                asset=asset,
                                 market=market,
                                 token_id=leg["other_token_id"],
                                 side="BUY",
@@ -676,12 +690,11 @@ class HighProbGrinder(BaseStrategy):
 
             # --- MODE 3: MODEL-BASED DIRECTIONAL ---
             # Use the random walk model to compute true probability from
-            # actual BTC spot data, then compare to market price.
+            # actual spot data, then compare to market price.
             #
             # P(up) = Φ((spot - ref) / (σ√T))
             #
             # Only trade when model_prob - implied_prob > fee + min_edge.
-            # This replaces the made-up "+2% edge" with a real computation.
             if cond in self._seen_conditions:
                 continue
 
@@ -692,9 +705,9 @@ class HighProbGrinder(BaseStrategy):
             ref_price = ref_data[1] if ref_data else 0.0
 
             # Compute model probability of "Up"
-            if btc_spot > 0 and ref_price > 0:
+            if spot > 0 and ref_price > 0:
                 model_up = _model_up_probability(
-                    btc_spot, ref_price, mins_left, self._vol_per_min,
+                    spot, ref_price, mins_left, vol_per_min,
                 )
                 model_down = 1.0 - model_up
             else:
@@ -702,7 +715,7 @@ class HighProbGrinder(BaseStrategy):
                 model_up = up_mid
                 model_down = 1.0 - up_mid
 
-            delta_pct = ((btc_spot - ref_price) / ref_price * 100
+            delta_pct = ((spot - ref_price) / ref_price * 100
                          if ref_price > 0 else 0.0)
 
             # Check both sides for model edge
@@ -740,7 +753,17 @@ class HighProbGrinder(BaseStrategy):
                 if ev_per_share <= 0:
                     continue
 
-                size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
+                # Edge-scaled sizing: bigger edge → bigger bet.
+                # Base $20 at 3% edge, scales up to $100 at 15%+.
+                base_size_usd = self.cfg["size_per_trade_usdc"]
+                edge_multiple = min(5.0, edge / 0.03)  # 1x at 3%, 5x at 15%
+                size_usd = base_size_usd * edge_multiple
+                size_usd = min(size_usd, 100.0)  # Hard cap
+                # Also cap at available depth
+                size = max(1, int(size_usd / entry_price))
+                size = min(size, int(ask_depth * 0.8))  # Don't eat entire book
+                if size < 1:
+                    continue
 
                 # Confidence from model certainty and time
                 if model_prob >= 0.90:
@@ -757,12 +780,12 @@ class HighProbGrinder(BaseStrategy):
                     confidence = min(1.0, confidence + 0.05)
 
                 signal = Signal(
-                    asset="BTC",
+                    asset=asset,
                     market=market,
                     token_id=token_id,
                     side="BUY",
                     token_side=token_side,
-                    spot_price=btc_spot,
+                    spot_price=spot,
                     target_price=ref_price,
                     implied_prob=implied_prob,
                     fair_prob=model_prob,
@@ -775,12 +798,12 @@ class HighProbGrinder(BaseStrategy):
                     suggested_size=size,
                     timestamp=time.time(),
                     reason=(
-                        f"MODEL: {token_side}@{entry_price:.2f} "
+                        f"MODEL: {asset} {token_side}@{entry_price:.2f} "
                         f"({duration}, {mins_left:.0f}m left) | "
                         f"model={model_prob:.1%} mkt={implied_prob:.1%} "
-                        f"edge={edge:+.1%} | "
-                        f"BTC {delta_pct:+.3f}% vs ref "
-                        f"σ={self._vol_per_min:.4f}/min"
+                        f"edge={edge:+.1%} ${size_usd:.0f} | "
+                        f"{asset} {delta_pct:+.3f}% vs ref "
+                        f"σ={vol_per_min:.4f}/min"
                     ),
                     strategy="high_prob_grinder",
                 )
@@ -800,13 +823,14 @@ class HighProbGrinder(BaseStrategy):
                 }
                 break
 
-        logger.info(f"[GRINDER] Up/Down: {scanned} mkts | "
+        assets_str = ",".join(self._updown_assets)
+        logger.info(f"[GRINDER] Up/Down ({assets_str}): {scanned} mkts | "
                      f"{locks_found} locks + {directional_found} directional | "
                      f"{len(self._open_legs)} open legs")
         return signals
 
     def _make_lock_signal(
-        self, market, duration, mins_left,
+        self, asset, market, duration, mins_left,
         up_token, up_ask, up_book,
         down_token, down_ask, down_book,
         net_profit, total_cost, lock_type,
@@ -827,7 +851,7 @@ class HighProbGrinder(BaseStrategy):
         size = min(size, int(min_depth))
 
         return Signal(
-            asset="BTC",
+            asset=asset,
             market=market,
             token_id=up_token,
             side="BUY",
