@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .config import RISK, STRATEGY, MARKET_MAKER, KELLY
+from .config import RISK, STRATEGY, MARKET_MAKER, HIGH_PROB_GRINDER, KELLY
 from .execution import Position, ExecutionState
 from .signals import Signal
 
@@ -346,11 +346,18 @@ class RiskManager:
         if is_lock:
             return True, "OK (lock — reduces risk)"
 
-        # Check correlation: don't stack too many positions on the same asset
-        # Market maker gets its own higher limit — it's hedged (both sides)
+        # Check correlation: don't stack too many positions on the same asset.
+        # MM and grinder get their own limits — they're designed for many
+        # small positions. Other strategies default to 2.
         same_asset = [p for p in open_positions if p.asset == signal.asset]
-        is_mm = getattr(signal, "strategy", "") == "market_maker"
-        max_per_asset = MARKET_MAKER["max_positions"] if is_mm else 2
+        strategy = getattr(signal, "strategy", "")
+        is_mm = strategy == "market_maker"
+        if is_mm:
+            max_per_asset = MARKET_MAKER["max_positions"]
+        elif strategy == "high_prob_grinder":
+            max_per_asset = HIGH_PROB_GRINDER.get("max_positions", 10)
+        else:
+            max_per_asset = 2
         if len(same_asset) >= max_per_asset:
             return False, f"Too many positions on {signal.asset} ({len(same_asset)}/{max_per_asset})"
 

@@ -515,7 +515,23 @@ class HighProbGrinder(BaseStrategy):
 
                 profit_per_share = 1.0 - entry_price
                 implied_prob = entry_price
-                estimated_true_prob = min(0.99, implied_prob + 0.02)
+
+                # Time-decay edge: as expiry approaches, the market
+                # price becomes more accurate. More time = more
+                # uncertainty = our edge above implied is smaller.
+                # Less time = price is nearly settled = if it's at
+                # 90%, true prob is closer to 95%+.
+                #
+                # Scale: 10+ min left → +1.5% edge
+                #        5 min left  → +2.5% edge
+                #        2 min left  → +4% edge (nearly settled)
+                if mins_left <= 2:
+                    edge_boost = 0.04
+                elif mins_left <= 5:
+                    edge_boost = 0.025
+                else:
+                    edge_boost = 0.015
+                estimated_true_prob = min(0.99, implied_prob + edge_boost)
 
                 ev_per_share = (estimated_true_prob * profit_per_share -
                                 (1 - estimated_true_prob) * entry_price)
@@ -525,16 +541,19 @@ class HighProbGrinder(BaseStrategy):
 
                 size = max(1, int(self.cfg["size_per_trade_usdc"] / entry_price))
 
-                # Confidence: scaled by how deep into the sweet spot
+                # Confidence: scaled by probability + time remaining.
+                # Higher prob + less time = more certain.
                 if self.cfg["sweet_spot_low"] <= entry_price <= self.cfg["sweet_spot_high"]:
                     confidence = 0.85
                 elif entry_price >= 0.85:
                     confidence = 0.75
                 else:
-                    # 78-85% range: still good on short-duration with momentum
                     confidence = 0.60
 
-                if duration == "5m":
+                # Time boost: less time left = more certainty
+                if mins_left <= 3:
+                    confidence = min(1.0, confidence + 0.10)
+                elif duration == "5m":
                     confidence = min(1.0, confidence + 0.05)
 
                 signal = Signal(
@@ -558,7 +577,7 @@ class HighProbGrinder(BaseStrategy):
                     reason=(
                         f"GRINDER-UPDOWN: {token_side}@{entry_price:.2f} "
                         f"({duration}, {mins_left:.0f}m left) | "
-                        f"EV={ev_per_share:+.4f}/share | "
+                        f"edge+{edge_boost:.1%} EV={ev_per_share:+.4f}/sh | "
                         f"spread={book.spread:.3f} depth={ask_depth:.0f}"
                     ),
                     strategy="high_prob_grinder",
