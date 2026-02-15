@@ -213,6 +213,12 @@ class MarketMaker(BaseStrategy):
 
             # Fair value: anchor on book midpoint + momentum bias
             book_mid_up = up_book.midpoint
+
+            # Skip pure coin-flip markets (45-55c both sides) when momentum
+            # is weak — no directional edge to lean into
+            if 0.45 <= book_mid_up <= 0.55 and abs(momentum_score) < 0.20:
+                continue
+
             bias = momentum_score * self.cfg["momentum_bias_weight"]
             fair_up = max(0.05, min(0.95, book_mid_up + bias))
             fair_down = 1.0 - fair_up
@@ -237,12 +243,17 @@ class MarketMaker(BaseStrategy):
             # We generate BUY signals at our bid price — the execution
             # engine places them as limit orders.
 
+            # Spread-based sizing: tighter spreads = more confidence = bigger size
+            # 1c spread → 1.5x size, 2c → 1.25x, 3c+ → 1x
+            avg_spread = (up_spread + down_spread) / 2
+            spread_mult = max(1.0, min(1.5, 1.5 - (avg_spread - 0.01) * 12.5))
+
             # Up side: post bid at best_bid + 0.01 (improve the book)
             our_up_bid = min(up_book.best_bid + 0.01, fair_up - half - skew)
             our_up_bid = max(0.01, min(0.99, round(our_up_bid, 2)))
             up_expected_profit = fair_up - our_up_bid  # profit if we buy here and it reverts to fair
             if up_expected_profit > 0.01 and inv < max_inv:
-                up_size = max(1, int(size_usdc / our_up_bid))
+                up_size = max(1, int(size_usdc * spread_mult / our_up_bid))
                 sig = self._make_signal(
                     market, up_token, "Up", our_up_bid, up_size,
                     up_expected_profit, fair_up, up_book.midpoint,
@@ -255,7 +266,7 @@ class MarketMaker(BaseStrategy):
             our_down_bid = max(0.01, min(0.99, round(our_down_bid, 2)))
             down_expected_profit = fair_down - our_down_bid
             if down_expected_profit > 0.01 and -inv < max_inv:
-                down_size = max(1, int(size_usdc / our_down_bid))
+                down_size = max(1, int(size_usdc * spread_mult / our_down_bid))
                 sig = self._make_signal(
                     market, down_token, "Down", our_down_bid, down_size,
                     down_expected_profit, fair_down, down_book.midpoint,
