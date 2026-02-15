@@ -388,9 +388,10 @@ MARKET_MAKER = {
     # At max inventory, shift by this many cents away from the heavy side
     "inventory_skew_max": 0.03,
     # Use spot momentum to bias fair value (lean into trends).
-    # 5-min markets swing 10-20c, so 10% bias (= up to 10c shift
-    # on a full-strength momentum signal) is appropriate.
-    "momentum_bias_weight": 0.10,
+    # Keep moderate (5%) — too high (10%) creates one-sided positions
+    # that all stop out together when price reverses. MM edge comes
+    # from the spread, not from directional bets.
+    "momentum_bias_weight": 0.05,
     # Only quote if we're at least this far from market expiry
     "min_minutes_to_expiry": 2,
     # Max exposure across all MM positions (MM is primary executor, let it use full cap)

@@ -201,9 +201,9 @@ def _calc_stop(signal, price: float) -> float:
 def _calc_tp(signal, price: float) -> float:
     """Calculate take profit price.
 
-    MM: 15c TP with 5c SL = 3:1 reward/risk.
-    With maker fills (no slippage), we keep the full TP.
-    Need only 25% win rate to break even.
+    MM: 15c TP with 8c SL = ~2:1 reward/risk.
+    With maker fills (no slippage on wins), we keep the full TP.
+    Need only ~35% win rate to break even.
     """
     is_mm = getattr(signal, "strategy", "") == "market_maker"
     if is_mm:
@@ -472,8 +472,10 @@ class ExecutionEngine:
         strategy = getattr(signal, "strategy", "")
         is_maker = strategy == "market_maker"
 
-        # Apply limit offset for non-aggressive orders
-        if EXECUTION["order_type"] == "limit":
+        # Apply limit offset for non-MM orders.
+        # MM strategy already computes the exact bid price — applying
+        # offset again would double-subtract and reduce edge.
+        if EXECUTION["order_type"] == "limit" and not is_maker:
             offset = EXECUTION["limit_offset"]
             if signal.side == "BUY":
                 price = max(0.01, price - offset)
@@ -498,8 +500,11 @@ class ExecutionEngine:
                                 f"best_ask={book.best_ask:.2f} "
                                 f"| {signal.market.question[:40]}")
                     return None
-                # Size is limited by what's realistic for a single maker order
-                size = min(size, 500)
+                # Hard cap: never risk more than $250 on a single maker order
+                # regardless of Kelly/boost scaling
+                max_maker_cost = RISK["max_position_usdc"]
+                max_maker_shares = max(1, int(max_maker_cost / price))
+                size = min(size, max_maker_shares)
                 slip_info = f"MAKER, spread={book.spread:.3f}, no_slippage"
             else:
                 # TAKER mode: walk the book for realistic fills
@@ -795,13 +800,20 @@ class ExecutionEngine:
                 closed.append(pos)
                 continue
 
-            # Near-expiry profit-taking: if close to max hold time and
-            # in profit, exit early to lock in gains instead of gambling
-            # on resolution. Within 2 minutes of expiry + in profit = exit.
+            # Near-expiry handling: exit before resolution to avoid gap risk.
+            # 5-min markets can gap 30-40c at resolution (token -> 0 or 1).
+            # An 8c stop becomes a 40c loss if we hold through resolution.
             if pos.max_hold_until > 0:
                 time_left = pos.max_hold_until - time.time()
+                # Within 2 min + in profit -> lock in gains
                 if time_left <= 120 and pos.unrealized_pnl > 0:
                     self._close_position(pos, current_price, "near_expiry_profit")
+                    closed.append(pos)
+                    continue
+                # Within 30 sec -> exit regardless to avoid resolution gap
+                if time_left <= 30:
+                    reason = "near_expiry_profit" if pos.unrealized_pnl > 0 else "near_expiry_exit"
+                    self._close_position(pos, current_price, reason)
                     closed.append(pos)
                     continue
 
@@ -824,19 +836,34 @@ class ExecutionEngine:
 
         mode = EXECUTION["mode"]
 
-        # Paper mode: simulate exit fill
-        is_maker_exit = pos.strategy == "market_maker"
-        if mode == "paper" and not is_maker_exit:
-            # Taker exit: walk the book (realistic slippage)
-            book = self.client.get_order_book(pos.token_id)
-            if book:
-                levels = book.bids if pos.side == "BUY" else book.asks
-                if levels:
-                    avg_fill, filled = _walk_book(levels, int(pos.entry_size))
-                    if filled > 0:
-                        exit_price = round(avg_fill, 4)
-        # MM exits as maker: post a limit on the other side at exit_price.
-        # No slippage — the exit_price (from midpoint) is our limit.
+        # Paper mode: simulate exit fill.
+        # Three exit modes:
+        #   1. MM take-profit / near-expiry: MAKER (zero slippage, post limit)
+        #   2. MM stop-loss / max-hold: HALF-SPREAD penalty (aggressive limit,
+        #      fills quickly on active 5m markets — not a full book walk)
+        #   3. Non-MM any exit: TAKER (walk the book, full slippage)
+        is_mm = pos.strategy == "market_maker"
+        is_urgent = reason in ("stop_loss", "max_hold_time", "market_expired", "near_expiry_exit")
+        if mode == "paper":
+            if is_mm and is_urgent:
+                # Aggressive limit exit: apply half the spread as penalty
+                book = self.client.get_order_book(pos.token_id)
+                if book:
+                    penalty = book.spread * 0.5
+                    if pos.side == "BUY":
+                        exit_price = round(exit_price - penalty, 4)
+                    else:
+                        exit_price = round(exit_price + penalty, 4)
+            elif not is_mm:
+                # Taker exit: walk the book (full slippage)
+                book = self.client.get_order_book(pos.token_id)
+                if book:
+                    levels = book.bids if pos.side == "BUY" else book.asks
+                    if levels:
+                        avg_fill, filled = _walk_book(levels, int(pos.entry_size))
+                        if filled > 0:
+                            exit_price = round(avg_fill, 4)
+            # else: MM non-urgent → maker exit, no slippage
 
         if pos.side == "BUY":
             pos.realized_pnl = (exit_price - pos.entry_price) * pos.entry_size

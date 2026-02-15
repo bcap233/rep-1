@@ -22,7 +22,7 @@ The concept:
     - Momentum bias lets us lean into trends when they appear
 
 Filters:
-  - Only 15m and 4h markets (5m too fast to manage inventory)
+  - Only 5m and 15m markets (4h books too thin, 10c+ slippage)
   - Min time to expiry (don't quote dying markets)
   - Inventory limits (cap net exposure)
   - Spread requirements (don't fight 1c spread markets)
@@ -211,14 +211,11 @@ class MarketMaker(BaseStrategy):
 
             eligible += 1
 
-            # Fair value: anchor on book midpoint + momentum bias
+            # Fair value: anchor on book midpoint + momentum bias.
+            # NOTE: Do NOT filter out 50/50 markets — those are where MM
+            # earns the spread by posting BOTH sides. Filtering them turns
+            # MM into a directional strategy with no hedge.
             book_mid_up = up_book.midpoint
-
-            # Skip pure coin-flip markets (45-55c both sides) when momentum
-            # is weak — no directional edge to lean into
-            if 0.45 <= book_mid_up <= 0.55 and abs(momentum_score) < 0.20:
-                continue
-
             bias = momentum_score * self.cfg["momentum_bias_weight"]
             fair_up = max(0.05, min(0.95, book_mid_up + bias))
             fair_down = 1.0 - fair_up
