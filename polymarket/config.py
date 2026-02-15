@@ -395,10 +395,11 @@ MARKET_MAKER = {
     # At max inventory, shift by this many cents away from the heavy side
     "inventory_skew_max": 0.03,
     # Use spot momentum to bias fair value (lean into trends).
-    # Keep moderate (5%) — too high (10%) creates one-sided positions
-    # that all stop out together when price reverses. MM edge comes
-    # from the spread, not from directional bets.
-    "momentum_bias_weight": 0.05,
+    # Keep low (2%) — higher values create one-sided positions that
+    # all stop out together when price reverses. MM edge comes from
+    # the spread, not from directional bets. Was 5%, reduced after
+    # observing 3:1 Down:Up dollar imbalance on bearish days.
+    "momentum_bias_weight": 0.02,
     # Only quote if we're at least this far from market expiry
     "min_minutes_to_expiry": 2,
     # Max exposure across all MM positions (MM is primary executor, let it use full cap)

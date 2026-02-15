@@ -439,28 +439,59 @@ class ExecutionEngine:
 
         # Don't double up on same market
         # MM can hold both sides (Up + Down) of the same market, and can
-        # stack up to 3 positions per side at different price levels
+        # stack up to 3 positions per side at different price levels.
+        # Balance rule: one side can't exceed 2x the other in $ terms.
         is_mm = getattr(signal, "strategy", "") == "market_maker"
-        for pos in self.state.positions:
-            if pos.condition_id == signal.market.condition_id and pos.status == "open":
-                if is_mm:
-                    if pos.token_side == signal.token_side:
-                        # Count existing positions on this side of this market
-                        same_side = [
-                            p for p in self.state.positions
-                            if p.condition_id == signal.market.condition_id
-                            and p.status == "open"
-                            and p.token_side == signal.token_side
-                        ]
-                        if len(same_side) >= 5:
-                            return False, f"MM: max 5 layers on {signal.token_side} in this market"
-                        # Don't stack at the exact same price level (±1c)
-                        if any(abs(p.entry_price - signal.suggested_price) < 0.01
-                               for p in same_side):
-                            return False, f"MM: already have {signal.token_side} at this price"
-                        break  # Allow it — different price level, under 3 layers
-                else:
-                    return False, f"Already have position in this market"
+        has_same_market = any(
+            p.condition_id == signal.market.condition_id and p.status == "open"
+            for p in self.state.positions
+        )
+
+        if has_same_market:
+            if is_mm:
+                mm_positions = [
+                    p for p in self.state.positions
+                    if p.condition_id == signal.market.condition_id
+                    and p.status == "open"
+                    and p.strategy == "market_maker"
+                ]
+                same_side = [p for p in mm_positions
+                             if p.token_side == signal.token_side]
+
+                # Max 3 layers per side (was 5 — too many stacked losses)
+                if len(same_side) >= 3:
+                    return False, f"MM: max 3 layers on {signal.token_side} in this market"
+
+                # Don't stack at the exact same price level (±1c)
+                if any(abs(p.entry_price - signal.suggested_price) < 0.01
+                       for p in same_side):
+                    return False, f"MM: already have {signal.token_side} at this price"
+
+                # Balance check: prevent directional overload.
+                # If we already hold one side but not the other, block adding
+                # more to the existing side until the other side catches up.
+                up_positions = [p for p in mm_positions if p.token_side == "Up"]
+                down_positions = [p for p in mm_positions if p.token_side == "Down"]
+                up_cost = sum(p.entry_cost for p in up_positions)
+                down_cost = sum(p.entry_cost for p in down_positions)
+                new_cost = signal.suggested_price * signal.suggested_size
+
+                if signal.token_side == "Up":
+                    # Block adding more Up if Down side is empty but Up isn't
+                    if len(up_positions) > 0 and len(down_positions) == 0:
+                        return False, "MM: open Down side before adding more Up"
+                    # Enforce max 2x dollar imbalance
+                    if down_cost > 0 and (up_cost + new_cost) > down_cost * 2.0:
+                        return False, (f"MM: Up ${up_cost + new_cost:.0f} would exceed "
+                                       f"2x Down ${down_cost:.0f}")
+                elif signal.token_side == "Down":
+                    if len(down_positions) > 0 and len(up_positions) == 0:
+                        return False, "MM: open Up side before adding more Down"
+                    if up_cost > 0 and (down_cost + new_cost) > up_cost * 2.0:
+                        return False, (f"MM: Down ${down_cost + new_cost:.0f} would exceed "
+                                       f"2x Up ${up_cost:.0f}")
+            else:
+                return False, f"Already have position in this market"
 
         return True, "OK"
 

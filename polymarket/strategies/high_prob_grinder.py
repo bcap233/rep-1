@@ -742,6 +742,13 @@ class HighProbGrinder(BaseStrategy):
                 effective_fee = fee_rate * (1.0 - entry_price)
                 edge = model_prob - implied_prob - effective_fee
 
+                # Require strong model conviction for directional entries.
+                # Coin-flip entries (model_prob ~55%) violate the grinder
+                # thesis — the whole point is grinding HIGH probability
+                # outcomes. A 54% ETH Down is not a grinder trade.
+                if model_prob < 0.75:
+                    continue
+
                 if edge < 0.03:
                     # Need at least 3% model edge to overcome noise
                     continue
