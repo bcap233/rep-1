@@ -97,6 +97,9 @@ class BankrollManager:
         The trade log records every close independently. If there's a gap
         (e.g., bankroll tracking started late, or a crash lost updates),
         this corrects cumulative_pnl and bankroll on startup.
+
+        Memory-optimised: pre-filters lines with string checks before
+        parsing JSON, and only extracts the two fields needed (action, pnl).
         """
         from .config import DATA
         trade_log_path = Path(DATA["trade_log"])
@@ -107,12 +110,17 @@ class BankrollManager:
             log_total = 0.0
             with open(trade_log_path) as f:
                 for line in f:
+                    # Fast pre-filter: skip lines that aren't CLOSE actions
+                    # without paying the cost of full JSON parsing.
+                    if '"CLOSE"' not in line:
+                        continue
                     line = line.strip()
                     if not line:
                         continue
                     entry = json.loads(line)
                     if entry.get("action") == "CLOSE":
                         log_total += entry.get("pnl", 0)
+                    del entry  # free immediately
         except Exception as e:
             logger.warning(f"[KELLY] Could not reconcile from trade log: {e}")
             return

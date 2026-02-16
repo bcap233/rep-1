@@ -403,6 +403,9 @@ class ExecutionEngine:
 
         Fixes drift caused by state resets, crashes, or missed updates.
         Only called on startup — not every save cycle.
+
+        Memory-optimised: pre-filters lines with cheap string checks
+        before doing full JSON parsing.
         """
         path = Path(DATA["trade_log"])
         if not path.exists():
@@ -415,11 +418,16 @@ class ExecutionEngine:
         try:
             with open(path) as f:
                 for line in f:
+                    # Fast pre-filter: skip non-CLOSE lines and lines from
+                    # other days without paying for full JSON parsing.
+                    if '"CLOSE"' not in line:
+                        continue
                     line = line.strip()
                     if not line:
                         continue
                     entry = json.loads(line)
                     if entry.get("action") != "CLOSE":
+                        del entry
                         continue
                     ts = entry.get("timestamp", 0)
                     trade_date = datetime.fromtimestamp(
@@ -428,6 +436,7 @@ class ExecutionEngine:
                     if trade_date == today:
                         today_pnl += entry.get("pnl", 0)
                         today_trades += 1
+                    del entry  # free immediately
         except Exception as e:
             logger.warning(f"[RECONCILE] Could not read trade log: {e}")
             return
