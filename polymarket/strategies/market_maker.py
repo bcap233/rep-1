@@ -22,7 +22,7 @@ The concept:
     - Momentum bias lets us lean into trends when they appear
 
 Filters:
-  - Only 5m and 15m markets (4h books too thin, 10c+ slippage)
+  - Only 5m, 10m, and 15m markets (4h books too thin, 10c+ slippage)
   - Min time to expiry (don't quote dying markets)
   - Inventory limits (cap net exposure)
   - Spread requirements (don't fight 1c spread markets)
@@ -72,6 +72,8 @@ def _parse_market_duration(question: str) -> Optional[str]:
         diff_min += 24 * 60  # crosses midnight
     if diff_min <= 5:
         return "5m"
+    elif diff_min <= 10:
+        return "10m"
     elif diff_min <= 15:
         return "15m"
     elif diff_min <= 240:

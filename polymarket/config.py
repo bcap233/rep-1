@@ -170,6 +170,11 @@ UPDOWN_DURATIONS = {
         "offset_seconds": 0,
         "label": "5-Minute",
     },
+    "10m": {
+        "interval_seconds": 600,
+        "offset_seconds": 0,
+        "label": "10-Minute",
+    },
     "15m": {
         "interval_seconds": 900,
         "offset_seconds": 0,
@@ -386,7 +391,7 @@ BILATERAL_ARB = {
 
 MARKET_MAKER = {
     # Which durations to make markets on
-    "durations": ["5m", "15m"],  # 4h books too thin (10c slippage kills edge)
+    "durations": ["5m", "10m", "15m"],  # 4h books too thin (10c slippage kills edge)
     # Spread we want to capture (half-spread on each side)
     "half_spread": 0.02,         # 2c on each side = 4c total spread
     # Min spread in the book before we quote
@@ -415,8 +420,8 @@ MARKET_MAKER = {
     # --- Inventory/time exit rules (replaces hard price stops for MM) ---
     # MM edge comes from the spread, not direction. Hard price stops amplify
     # losses by forcing exits on noise. Instead: inventory caps + time rules.
-    "wind_down_seconds": 60,       # Start closing MM positions this far from expiry
-    "inventory_exit_ratio": 2.5,   # Force-close heavy side when $ ratio exceeds this
+    "wind_down_seconds": 90,       # Start closing MM positions this far from expiry (was 60)
+    "inventory_exit_ratio": 3.5,   # Force-close heavy side when $ ratio exceeds this (was 2.5, matches 3x entry cap)
 
     # --- Regime gating: pull back when conditions are adverse for MM ---
     # Strong trends = bad for spread capture. Widen quotes and reduce size.

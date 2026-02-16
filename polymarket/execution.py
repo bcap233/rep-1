@@ -579,9 +579,9 @@ class ExecutionEngine:
                 same_side = [p for p in mm_positions
                              if p.token_side == signal.token_side]
 
-                # Max 3 layers per side (was 5 — too many stacked losses)
-                if len(same_side) >= 3:
-                    return False, f"MM: max 3 layers on {signal.token_side} in this market"
+                # Max 5 layers per side (was 3 — throttled too aggressively)
+                if len(same_side) >= 5:
+                    return False, f"MM: max 5 layers on {signal.token_side} in this market"
 
                 # Don't stack at the exact same price level (±1c)
                 if any(abs(p.entry_price - signal.suggested_price) < 0.01
@@ -598,19 +598,19 @@ class ExecutionEngine:
                 new_cost = signal.suggested_price * signal.suggested_size
 
                 if signal.token_side == "Up":
-                    # Block adding more Up if Down side is empty but Up isn't
-                    if len(up_positions) > 0 and len(down_positions) == 0:
+                    # Only block if already 2+ layers ahead with no Down side
+                    if len(up_positions) >= 2 and len(down_positions) == 0:
                         return False, "MM: open Down side before adding more Up"
-                    # Enforce max 2x dollar imbalance
-                    if down_cost > 0 and (up_cost + new_cost) > down_cost * 2.0:
+                    # Enforce max 3x dollar imbalance (was 2x — too restrictive)
+                    if down_cost > 0 and (up_cost + new_cost) > down_cost * 3.0:
                         return False, (f"MM: Up ${up_cost + new_cost:.0f} would exceed "
-                                       f"2x Down ${down_cost:.0f}")
+                                       f"3x Down ${down_cost:.0f}")
                 elif signal.token_side == "Down":
-                    if len(down_positions) > 0 and len(up_positions) == 0:
+                    if len(down_positions) >= 2 and len(up_positions) == 0:
                         return False, "MM: open Up side before adding more Down"
-                    if up_cost > 0 and (down_cost + new_cost) > up_cost * 2.0:
+                    if up_cost > 0 and (down_cost + new_cost) > up_cost * 3.0:
                         return False, (f"MM: Down ${down_cost + new_cost:.0f} would exceed "
-                                       f"2x Up ${up_cost:.0f}")
+                                       f"3x Up ${up_cost:.0f}")
             else:
                 return False, f"Already have position in this market"
 
