@@ -253,11 +253,13 @@ class BankrollManager:
         Return scaled risk limits based on current bankroll.
 
         These override the static config values.
+        Hard per-trade cap is never scaled (absolute ceiling).
         """
         s = self.scale_factor()
+        hard_cap = RISK.get("hard_max_per_trade_usdc", 150.0)
         return {
             "max_total_exposure_usdc": RISK["max_total_exposure_usdc"] * s,
-            "max_position_usdc": RISK["max_position_usdc"] * s,
+            "max_position_usdc": min(RISK["max_position_usdc"] * s, hard_cap),
             "daily_loss_limit_usdc": RISK["daily_loss_limit_usdc"] * s,
             "mm_max_exposure_usdc": MARKET_MAKER["max_exposure_usdc"] * s,
         }
@@ -462,12 +464,20 @@ class RiskManager:
                     state: ExecutionState) -> float:
         """
         Adjust position size based on portfolio context.
-        Uses Kelly-scaled limits for dynamic bankroll growth.
+
+        MM book: sized by remaining capacity only. No confidence/loss
+        scaling — spread trading has different loss characteristics
+        than directional bets.
+
+        Directional book (grinder, spot_div, etc.): scaled by
+        confidence and daily loss ratio. Stops make sense here
+        because you're taking a view.
 
         Returns the adjusted size (number of shares).
         """
         limits = self.bankroll.get_effective_limits()
         base_size = signal.suggested_size
+        strategy = getattr(signal, "strategy", "")
 
         # Scale down as we approach max exposure (Kelly-scaled)
         open_positions = [p for p in state.positions if p.status == "open"]
@@ -484,15 +494,20 @@ class RiskManager:
         if base_cost > max_cost:
             base_size = max(1, int(max_cost / signal.suggested_price))
 
-        # Scale by confidence
-        if signal.confidence < 0.5:
-            base_size = max(1, int(base_size * 0.5))
+        # --- Directional book: confidence + loss scaling ---
+        if strategy != "market_maker":
+            # Scale by confidence
+            if signal.confidence < 0.5:
+                base_size = max(1, int(base_size * 0.5))
 
-        # Scale down after losses (using Kelly-scaled daily limit)
-        if state.daily_pnl < 0:
-            loss_ratio = abs(state.daily_pnl) / limits["daily_loss_limit_usdc"]
-            scale = max(0.25, 1 - loss_ratio)
-            base_size = max(1, int(base_size * scale))
+            # Scale down after losses (using Kelly-scaled daily limit)
+            if state.daily_pnl < 0:
+                loss_ratio = abs(state.daily_pnl) / limits["daily_loss_limit_usdc"]
+                scale = max(0.25, 1 - loss_ratio)
+                base_size = max(1, int(base_size * scale))
+
+        # MM book: no confidence/loss scaling — spread trades don't benefit
+        # from shrinking after losses (loss is from inventory, not direction)
 
         return base_size
 

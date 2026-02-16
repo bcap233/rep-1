@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from .config import EXECUTION, RISK, DATA
+from .config import EXECUTION, RISK, DATA, MARKET_MAKER
 from .polymarket_client import PolymarketClient, Order, OrderBook
 from .signals import Signal
 
@@ -176,19 +176,16 @@ class ExecutionState:
 def _calc_stop(signal, price: float) -> float:
     """Calculate stop loss price by strategy.
 
-    MM: 8c stop — 5-min markets swing 5-10c within a window, so 5c
-        was getting stopped out then reversing. 8c survives the noise.
-        With 15c TP this is still ~2:1 reward/risk.
-    Spot divergence: 10c
+    MM: NO STOP (0.0) — hard price stops amplify losses for market makers.
+        MM exits via inventory/time rules in _mm_inventory_check() instead.
+    Spot divergence: 10c (directional book — stops make sense)
     High prob grinder: no stop (0.0) — hold to resolution.
-        The whole thesis is that 90%+ events resolve YES ~96% of the time.
-        Stopping out on noise defeats the strategy.
     Bilateral arb: no stop (handled separately in _execute_bilateral).
     Other: config default (18c)
     """
     strategy = getattr(signal, "strategy", "")
     if strategy == "market_maker":
-        sl_dist = 0.08
+        return 0.0  # No hard stop — inventory/time rules handle exits
     elif strategy == "spot_divergence":
         sl_dist = 0.10
     elif strategy in ("high_prob_grinder", "bilateral_arb"):
@@ -208,17 +205,17 @@ def _calc_stop(signal, price: float) -> float:
 def _calc_tp(signal, price: float) -> float:
     """Calculate take profit price.
 
-    MM: 15c TP with 8c SL = ~2:1 reward/risk.
-    With maker fills (no slippage on wins), we keep the full TP.
-    Need only ~35% win rate to break even.
+    MM: NO TP (0.0) — exit via inventory/time rules, not price targets.
+        MM profit comes from spread capture, not price movement.
     High prob grinder: no TP — hold to resolution for full $1.00 payout.
     Bilateral arb: no TP — hold to resolution (guaranteed payout).
+    Spot divergence / other: config default (20c)
     """
     strategy = getattr(signal, "strategy", "")
     if strategy in ("high_prob_grinder", "bilateral_arb"):
         return 0.0  # Hold to resolution
     if strategy == "market_maker":
-        tp_dist = 0.15
+        return 0.0  # No hard TP — inventory/time rules handle exits
     else:
         tp_dist = RISK["take_profit"]
 
@@ -290,6 +287,55 @@ def _market_end_timestamp(question: str, end_date: str = "") -> Optional[float]:
     return None
 
 
+class MMHealthTracker:
+    """Track paired-fill rate for market maker — early warning for adverse selection.
+
+    Of all MM exits, what % came from markets where both legs (Up+Down)
+    were filled? If this drops, the MM is being picked off by informed
+    flow and should step back.
+    """
+
+    def __init__(self):
+        # condition_id → set of sides filled ("Up", "Down")
+        self._market_fills: dict[str, set[str]] = {}
+        self._paired_exits = 0
+        self._unpaired_exits = 0
+
+    def record_fill(self, condition_id: str, side: str):
+        """Record an MM fill on a side."""
+        if condition_id not in self._market_fills:
+            self._market_fills[condition_id] = set()
+        self._market_fills[condition_id].add(side)
+
+    def record_exit(self, condition_id: str, side: str):
+        """Record an MM exit — check if it was part of a paired round trip."""
+        fills = self._market_fills.get(condition_id, set())
+        if len(fills) >= 2:  # Both Up and Down were filled at some point
+            self._paired_exits += 1
+        else:
+            self._unpaired_exits += 1
+        # Clean up if no more positions on this market
+        fills.discard(side)
+        if not fills:
+            self._market_fills.pop(condition_id, None)
+
+    @property
+    def paired_fill_rate(self) -> float:
+        """Fraction of exits that were part of a paired round trip."""
+        total = self._paired_exits + self._unpaired_exits
+        if total < 10:
+            return 1.0  # Not enough data yet
+        return self._paired_exits / total
+
+    def summary(self) -> dict:
+        return {
+            "paired_exits": self._paired_exits,
+            "unpaired_exits": self._unpaired_exits,
+            "paired_fill_rate": round(self.paired_fill_rate, 3),
+            "active_markets": len(self._market_fills),
+        }
+
+
 class ExecutionEngine:
     """
     Manages trade execution and position lifecycle.
@@ -307,6 +353,7 @@ class ExecutionEngine:
         self.bankroll = bankroll_mgr  # Optional BankrollManager for Kelly reinvestment
         self._position_counter = 0
         self._mm_strategy = None  # Set by runner to wire up inventory tracking
+        self._mm_health = MMHealthTracker()
         self._load_state()
 
     def _next_position_id(self) -> str:
@@ -561,6 +608,58 @@ class ExecutionEngine:
         return True, "OK"
 
     # --------------------------------------------------------
+    # MM inventory/time management (replaces hard stops)
+    # --------------------------------------------------------
+
+    def _mm_inventory_check(self, pos: Position, current_price: float) -> bool:
+        """Inventory/time-based exit for MM positions.
+
+        Replaces hard price stops. MM edge comes from spread, not direction,
+        so price-based stops amplify losses on whipsaw. Instead:
+        1. Wind down near expiry (exit before resolution gap risk)
+        2. Rebalance when inventory is lopsided ($ imbalance)
+        3. Pull back when paired-fill rate drops (adverse selection)
+
+        Returns True if position was closed.
+        """
+        # 1. Time wind-down: exit MM positions before expiry
+        if pos.max_hold_until > 0:
+            time_left = pos.max_hold_until - time.time()
+            wind_down = MARKET_MAKER.get("wind_down_seconds", 60)
+
+            if time_left <= wind_down:
+                reason = "mm_wind_down_profit" if pos.unrealized_pnl > 0 else "mm_wind_down"
+                self._close_position(pos, current_price, reason)
+                return True
+
+        # 2. Inventory imbalance: force-close heavy side to rebalance
+        max_ratio = MARKET_MAKER.get("inventory_exit_ratio", 2.5)
+        mm_on_market = [
+            p for p in self.state.positions
+            if p.condition_id == pos.condition_id
+            and p.status == "open"
+            and p.strategy == "market_maker"
+        ]
+        up_cost = sum(p.entry_cost for p in mm_on_market if p.token_side == "Up")
+        down_cost = sum(p.entry_cost for p in mm_on_market if p.token_side == "Down")
+
+        if up_cost > 0 and down_cost > 0:
+            if pos.token_side == "Up" and up_cost > down_cost * max_ratio:
+                self._close_position(pos, current_price, "mm_inventory_rebalance")
+                return True
+            if pos.token_side == "Down" and down_cost > up_cost * max_ratio:
+                self._close_position(pos, current_price, "mm_inventory_rebalance")
+                return True
+
+        # 3. Adverse selection: if paired-fill rate is low, shed losing positions
+        min_pfr = MARKET_MAKER.get("min_paired_fill_rate", 0.30)
+        if self._mm_health.paired_fill_rate < min_pfr and pos.unrealized_pnl < 0:
+            self._close_position(pos, current_price, "mm_adverse_selection")
+            return True
+
+        return False
+
+    # --------------------------------------------------------
     # Execution
     # --------------------------------------------------------
 
@@ -703,14 +802,16 @@ class ExecutionEngine:
         self.state.positions.append(position)
         self.state.daily_trades += 1
 
-        # Update MM inventory tracking on open
-        if position.strategy == "market_maker" and self._mm_strategy is not None:
-            try:
-                self._mm_strategy.update_inventory(
-                    position.condition_id, position.token_side, position.entry_size
-                )
-            except Exception:
-                pass
+        # Update MM inventory + health tracking on open
+        if position.strategy == "market_maker":
+            if self._mm_strategy is not None:
+                try:
+                    self._mm_strategy.update_inventory(
+                        position.condition_id, position.token_side, position.entry_size
+                    )
+                except Exception:
+                    pass
+            self._mm_health.record_fill(position.condition_id, position.token_side)
 
         self._log_trade(position, "OPEN")
         self._save_state()
@@ -865,6 +966,12 @@ class ExecutionEngine:
             else:
                 pos.unrealized_pnl = (pos.entry_price - current_price) * pos.entry_size
 
+            # MM: inventory/time management (no hard stops)
+            if pos.strategy == "market_maker":
+                if self._mm_inventory_check(pos, current_price):
+                    closed.append(pos)
+                    continue
+
             # Hold-to-resolution strategies (grinder, bilateral arb) have
             # stop=0 and tp=0. They resolve when the market closes.
             # Skip stop/TP/trailing logic for them — only time-based exit applies.
@@ -970,7 +1077,8 @@ class ExecutionEngine:
         #      fills quickly on active 5m markets — not a full book walk)
         #   3. Non-MM any exit: TAKER (walk the book, full slippage)
         is_mm = pos.strategy == "market_maker"
-        is_urgent = reason in ("stop_loss", "max_hold_time", "market_expired", "near_expiry_exit")
+        is_urgent = reason in ("stop_loss", "max_hold_time", "market_expired", "near_expiry_exit",
+                               "mm_wind_down", "mm_inventory_rebalance", "mm_adverse_selection")
         if mode == "paper":
             if is_mm and is_urgent:
                 # Aggressive limit exit: apply half the spread as penalty
@@ -1040,14 +1148,16 @@ class ExecutionEngine:
                 time.time() + RISK["loss_cooldown_seconds"]
             )
 
-        # Update MM inventory tracking (negative shares = sold/closed)
-        if pos.strategy == "market_maker" and self._mm_strategy is not None:
-            try:
-                self._mm_strategy.update_inventory(
-                    pos.condition_id, pos.token_side, -pos.entry_size
-                )
-            except Exception:
-                pass  # Don't let inventory tracking break closes
+        # Update MM inventory + health tracking on close
+        if pos.strategy == "market_maker":
+            if self._mm_strategy is not None:
+                try:
+                    self._mm_strategy.update_inventory(
+                        pos.condition_id, pos.token_side, -pos.entry_size
+                    )
+                except Exception:
+                    pass  # Don't let inventory tracking break closes
+            self._mm_health.record_exit(pos.condition_id, pos.token_side)
 
         # Move to closed list
         if pos in self.state.positions:

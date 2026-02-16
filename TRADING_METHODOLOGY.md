@@ -38,6 +38,19 @@
 - If yes, buys cheaper side for a risk-free lock (guaranteed $1.00 payout)
 - This is an embedded arb on top of the market-making flow
 
+### Exit Rules (Inventory/Time — No Hard Price Stops)
+Hard price stops amplify losses for MM. Instead, exits use:
+1. **Time wind-down:** Close all MM positions 60s before market expiry
+2. **Inventory rebalance:** Force-close heavy side when $ imbalance exceeds 2.5:1
+3. **Adverse selection:** If paired-fill rate drops below 30%, shed losing positions
+4. **Market expiry:** Auto-close when book disappears
+
+### Regime Gating
+When |momentum| exceeds 0.5 (strong trend — bad for MM):
+- Widen spread up to 3x (reduce fill rate to avoid being picked off)
+- Reduce size down to 0.25x (limit exposure in adverse conditions)
+- Progressive scaling: worse conditions → more defensive
+
 ### Filters
 | Rule | Value |
 |------|-------|
@@ -46,8 +59,12 @@
 | Min time to expiry | 2 minutes (don't quote dying markets) |
 | Max exposure | $4,800 |
 | Max positions | 50 |
-| Half spread | 2c per side (4c total) |
+| Half spread | 2c per side (4c total), widened in bad regime |
 | Momentum bias weight | 2% (was 5%, reduced after observing 3:1 Down:Up imbalance on bearish days) |
+| Wind-down seconds | 60s before expiry |
+| Inventory exit ratio | 2.5:1 $ imbalance |
+| Min paired-fill rate | 30% (below = adverse selection) |
+| Regime momentum threshold | |momentum| > 0.5 |
 
 ---
 
@@ -206,12 +223,27 @@ Spot Divergence currently operates as a **scout** — it feeds directional convi
 | Max Grinder exposure | $2,000 |
 | Max Bilateral exposure | $2,000 |
 
-### Exit Rules
+### Exit Rules (Separated by Book Type)
+
+**MM Book** (inventory-managed, no hard price stops):
 | Rule | Value |
 |------|-------|
-| Stop loss | $0.18 (18c move against) |
-| Take profit | $0.20 (20c move in favor) |
-| Max hold time | 120 minutes |
+| Stop loss | NONE — inventory/time rules instead |
+| Take profit | NONE — exit via wind-down or rebalance |
+| Wind-down | Close all MM positions 60s before expiry |
+| Inventory rebalance | Force-close heavy side at 2.5:1 $ ratio |
+| Adverse selection | Shed losers when paired-fill rate < 30% |
+| Loss cooldown | 30 seconds per market after a loss |
+| Daily loss limit | $200 (stop all trading for the day) |
+
+**Directional Book** (grinder exits at resolution; spot_div has stops):
+| Rule | Value |
+|------|-------|
+| Spot div stop loss | $0.10 (10c move against) |
+| Spot div take profit | $0.20 (20c move in favor) |
+| Grinder stop loss | NONE (hold to resolution) |
+| Bilateral arb stop | NONE (hold to resolution) |
+| Max hold time | 120 minutes (directional) |
 | Loss cooldown | 30 seconds per market after a loss |
 | Daily loss limit | $200 (stop all trading for the day) |
 
@@ -219,14 +251,15 @@ Spot Divergence currently operates as a **scout** — it feeds directional convi
 | Parameter | Value |
 |-----------|-------|
 | Initial bankroll | $5,000 |
-| Kelly fraction | 0.50 (half-Kelly) |
+| Kelly fraction | 0.10 (tenth-Kelly — was 0.5, capped harder) |
+| Hard per-trade cap | $150 (absolute ceiling, never scaled) |
 | Min trades before Kelly | 20 |
 | Rolling window | 100 trades |
 | Min scale | 0.5x base size |
-| Max scale | 3.0x base size |
+| Max scale | 1.5x base size (was 3.0x) |
 | Drawdown throttle | 15% from peak → force 1.0x scale |
 
-**Half-Kelly rationale:** ~75% of full-Kelly growth with much less variance. At 100+ trades, the rolling win rate and average win/loss ratio feed into the Kelly formula to dynamically adjust position sizing.
+**Tenth-Kelly rationale:** Prevents the classic failure mode: small positive edge + large position + regime shift = blowup. Combined with $150 hard cap, no single trade can exceed $150 regardless of bankroll growth. No intraday compounding from recent wins — scale is capped conservatively.
 
 ---
 
@@ -265,6 +298,26 @@ Spot Divergence currently operates as a **scout** — it feeds directional convi
 | Runtime | ~44 hours |
 | Best asset | BTC (all profit) |
 | Last 100 trades | -$114 (edge compression noted) |
+
+---
+
+## Health Metrics
+
+### Paired-Fill Rate (MM Early Warning)
+Of all MM exits, what % came from markets where both sides (Up+Down) were filled?
+
+| Metric | Meaning |
+|--------|---------|
+| > 70% | Healthy — MM is capturing spreads as intended |
+| 30-70% | Watch — some adverse selection occurring |
+| < 30% | Danger — being picked off by informed flow, scale back |
+
+When paired-fill rate drops below 30%, the bot automatically:
+- Sheds losing MM positions (adverse_selection exit)
+- Continues logging the rate for monitoring
+
+This metric predicts "edge compression" earlier than PnL because it detects
+when the MM is systematically filling one side but not the other (toxic flow).
 
 ---
 

@@ -167,6 +167,21 @@ class MarketMaker(BaseStrategy):
                 if analyses:
                     momentum_score, _ = multi_timeframe_consensus(analyses)
 
+        # Regime gating: detect adverse conditions for market making.
+        # Strong trends = bad for spread capture. Widen quotes, reduce size.
+        regime_spread_mult = 1.0
+        regime_size_mult = 1.0
+        abs_mom = abs(momentum_score)
+        mom_threshold = self.cfg.get("regime_momentum_threshold", 0.5)
+        if abs_mom > mom_threshold:
+            ratio = abs_mom / mom_threshold
+            # Progressive widening: 2x spread at threshold, up to 3x
+            regime_spread_mult = min(3.0, 1.0 + (self.cfg.get("regime_spread_mult", 2.0) - 1.0) * (ratio - 1.0) + 1.0)
+            # Progressive size reduction: 0.5x at threshold, down to 0.25x
+            regime_size_mult = max(0.25, self.cfg.get("regime_size_mult", 0.5) ** ratio)
+            logger.info(f"[MM] REGIME GATE: |momentum|={abs_mom:.2f} > {mom_threshold} → "
+                        f"spread {regime_spread_mult:.1f}x, size {regime_size_mult:.2f}x")
+
         # Find BTC Up/Down markets
         markets = self.client.find_btc_updown_markets()
         if not markets:
@@ -227,8 +242,8 @@ class MarketMaker(BaseStrategy):
             if max_inv > 0 and abs(inv) > 0:
                 skew = (inv / max_inv) * self.cfg["inventory_skew_max"]
 
-            half = self.cfg["half_spread"]
-            size_usdc = self.cfg["size_per_side_usdc"]
+            half = self.cfg["half_spread"] * regime_spread_mult
+            size_usdc = self.cfg["size_per_side_usdc"] * regime_size_mult
 
             # ---- Market-making approach ----
             # We post passive limit bids that improve the current best bid

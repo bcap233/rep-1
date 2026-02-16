@@ -355,6 +355,13 @@ def run_cycle(strategies: list[BaseStrategy], engine: ExecutionEngine,
                         f"win rate {len([p for p in b.trade_history if p > 0])}"
                         f"/{len(b.trade_history)}")
 
+    # Log MM health (paired-fill rate — early warning for adverse selection)
+    mm_h = engine._mm_health.summary()
+    if mm_h["paired_exits"] + mm_h["unpaired_exits"] > 0:
+        logger.info(f"[MM HEALTH] Paired-fill rate: {mm_h['paired_fill_rate']:.1%} "
+                    f"({mm_h['paired_exits']}p/{mm_h['unpaired_exits']}u) | "
+                    f"{mm_h['active_markets']} active markets")
+
     # Step 1: Update existing positions (check stops/TPs)
     closed = engine.update_positions()
     if closed:

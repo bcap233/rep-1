@@ -250,6 +250,10 @@ RISK = {
 
     # Daily loss limit (USDC). Stop trading for the day if hit.
     "daily_loss_limit_usdc": 200.0,
+
+    # Hard per-trade cap (USDC). Absolute ceiling, never scaled by Kelly.
+    # Prevents any single trade from exceeding this regardless of bankroll growth.
+    "hard_max_per_trade_usdc": 150.0,
 }
 
 # ============================================================
@@ -262,9 +266,10 @@ KELLY = {
     # Starting bankroll (paper or real USDC)
     "initial_bankroll_usdc": 5_000.0,
 
-    # Kelly fraction multiplier (1.0 = full Kelly, 0.5 = half-Kelly)
-    # Half-Kelly gives ~75% of full-Kelly growth with much less variance.
-    "fraction": 0.5,
+    # Kelly fraction multiplier. Capped at 0.1 (tenth-Kelly) to prevent
+    # runaway sizing. Combined with hard per-trade cap, this prevents
+    # the "small edge + large stop + regime shift = blowup" failure mode.
+    "fraction": 0.1,
 
     # Minimum trades before Kelly kicks in (need stats to compute it)
     "min_trades_for_kelly": 20,
@@ -272,9 +277,9 @@ KELLY = {
     # Rolling window for Kelly calculation (last N closed trades)
     "rolling_window": 100,
 
-    # Bankroll scale limits — never scale below 0.5x or above 3.0x base
+    # Bankroll scale limits — never scale below 0.5x or above 1.5x base
     "min_scale": 0.5,
-    "max_scale": 3.0,
+    "max_scale": 1.5,
 
     # Drawdown throttle: if drawdown from peak exceeds this % of bankroll,
     # scale back to 1.0x regardless of Kelly
@@ -406,6 +411,21 @@ MARKET_MAKER = {
     "max_exposure_usdc": 4_800.0,
     # Max concurrent MM positions (each market = 1 position tracking both sides)
     "max_positions": 50,
+
+    # --- Inventory/time exit rules (replaces hard price stops for MM) ---
+    # MM edge comes from the spread, not direction. Hard price stops amplify
+    # losses by forcing exits on noise. Instead: inventory caps + time rules.
+    "wind_down_seconds": 60,       # Start closing MM positions this far from expiry
+    "inventory_exit_ratio": 2.5,   # Force-close heavy side when $ ratio exceeds this
+
+    # --- Regime gating: pull back when conditions are adverse for MM ---
+    # Strong trends = bad for spread capture. Widen quotes and reduce size.
+    "regime_momentum_threshold": 0.5,  # |momentum| above this triggers gating
+    "regime_spread_mult": 2.0,         # Widen spread by this factor in bad regime
+    "regime_size_mult": 0.5,           # Reduce size by this factor in bad regime
+
+    # --- Health monitoring ---
+    "min_paired_fill_rate": 0.30,  # Below this = adverse selection, shed losers
 }
 
 # ============================================================
