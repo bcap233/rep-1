@@ -130,14 +130,14 @@ ASSETS = {
         "coinbase": "ETH-USD",
         "kraken": "XETHZUSD",
         "polymarket_tags": ["ethereum", "eth"],
-        "updown_enabled": True,
+        "updown_enabled": False,  # Paused — losing money on thin liquidity
     },
     "SOL": {
         "binance": "SOLUSDT",
         "coinbase": "SOL-USD",
         "kraken": "SOLUSD",
         "polymarket_tags": ["solana", "sol"],
-        "updown_enabled": True,
+        "updown_enabled": False,  # Paused — losing money on thin liquidity
     },
 }
 
