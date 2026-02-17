@@ -46,8 +46,6 @@ output/
 Thumbs.db
 
 # Bot runtime state
-bot/state.json
-bot/bot.log
 polymarket/state.json
 polymarket/trades.jsonl
 polymarket/bot.log
