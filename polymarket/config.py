@@ -324,8 +324,9 @@ EXECUTION = {
 # Profit per win is small (5-15c) but win rate is very high.
 
 HIGH_PROB_GRINDER = {
-    # ACTIVE: execute trades on high-probability markets
-    "watch_only": False,
+    # DISABLED: grinder was net-negative PnL (-$173 on Feb 15, -$21 on Feb 16)
+    # Keeping as watch-only so it still feeds intelligence to MM boost
+    "watch_only": True,
     # Buy tokens priced in this range (checks both YES and NO sides)
     "min_probability": 0.85,
     "max_probability": 0.97,
