@@ -2,18 +2,19 @@
 
 ## IMPORTANT: Bot Uptime
 
-The trading bot must stay running continuously to collect clean data. **At the start of every session**, run the watchdog before doing anything else:
+The trading bot must stay running continuously to collect clean data. **At the start of every session**, run the ensure script before doing anything else:
 
 ```bash
-./watchdog.sh start
+./ensure_bot.sh
 ```
 
-This is idempotent — safe to call even if the bot is already running. It checks for the process and only starts a new one if needed. The bot runs inside a tmux session (`polybot`) for persistence.
+This is idempotent — it ensures cron is running, the cron watchdog entry exists, and the bot is alive. Even between sessions, a cron job runs `watchdog.sh` every 5 minutes to auto-restart the bot if it dies.
 
-Other watchdog commands:
+Other commands:
 - `./watchdog.sh status` — check if bot is alive + last activity
 - `./watchdog.sh restart` — stop and restart
 - `./watchdog.sh stop` — stop the bot
+- `./ensure_bot.sh` — full startup: cron + crontab + bot (run this first)
 
 ## Architecture
 
