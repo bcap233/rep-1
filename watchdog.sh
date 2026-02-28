@@ -32,6 +32,11 @@ is_bot_running() {
         pgrep -f "python3 -m polymarket --loop" | head -1 > "$PIDFILE"
         return 0
     fi
+    # Also check if the run_bot.sh wrapper is alive (it may be in backoff sleep)
+    if pgrep -f "bash run_bot.sh" > /dev/null 2>&1; then
+        pgrep -f "bash run_bot.sh" | head -1 > "$PIDFILE"
+        return 0
+    fi
     return 1
 }
 
@@ -45,8 +50,11 @@ start_bot() {
 
     echo "[watchdog] Bot not running. Starting via tmux..."
 
-    # Kill any stale tmux session
+    # Kill any stale tmux session and orphaned processes
     tmux kill-session -t polybot 2>/dev/null || true
+    pkill -f "python3 -m polymarket --loop" 2>/dev/null || true
+    rm -f "data/run_bot.lock"
+    sleep 1
 
     # Start in a tmux session (survives terminal close)
     tmux new-session -d -s polybot "cd $SCRIPT_DIR && bash run_bot.sh"
